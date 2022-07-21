@@ -96,6 +96,7 @@ impl Parse for Opts {
                 let s = input.parse::<syn::LitStr>()?;
                 files.push(s.value());
             }
+            println!("{:?}", files);
             let mut interfaces = Vec::new();
             let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
             for path in files.iter() {

@@ -971,6 +971,7 @@ impl Generator for Wasmtime {
                 name
             ));
             for (name, (ty, _)) in exports.fields.iter() {
+                self.push_str("pub ");
                 self.push_str(name);
                 self.push_str(": ");
                 self.push_str(ty);
