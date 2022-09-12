@@ -58,6 +58,7 @@ struct UseName<'a> {
 pub struct Resource<'a> {
     docs: Docs<'a>,
     name: Id<'a>,
+    supertype: Option<Id<'a>>,
     values: Vec<(bool, Value<'a>)>,
 }
 
@@ -97,6 +98,8 @@ enum Type<'a> {
     Enum(Enum<'a>),
     Option(Box<Type<'a>>),
     Expected(Expected<'a>),
+    Future(Box<Type<'a>>),
+    Stream(Stream<'a>),
     Union(Union<'a>),
 }
 
@@ -143,6 +146,11 @@ struct EnumCase<'a> {
 struct Expected<'a> {
     ok: Box<Type<'a>>,
     err: Box<Type<'a>>,
+}
+
+struct Stream<'a> {
+    element: Box<Type<'a>>,
+    end: Box<Type<'a>>,
 }
 
 pub struct Value<'a> {
@@ -216,7 +224,7 @@ impl<'a> Item<'a> {
             Some((_span, Token::Id)) | Some((_span, Token::ExplicitId)) => {
                 Value::parse(tokens, docs).map(Item::Value)
             }
-            other => Err(err_expected(tokens, "`type`, `resource`, or `fn`", other).into()),
+            other => Err(err_expected(tokens, "`type`, `resource`, or `func`", other).into()),
         }
     }
 }
@@ -370,6 +378,11 @@ impl<'a> Resource<'a> {
     fn parse(tokens: &mut Tokenizer<'a>, docs: Docs<'a>) -> Result<Self> {
         tokens.expect(Token::Resource)?;
         let name = parse_id(tokens)?;
+        let supertype = if tokens.eat(Token::Implements)? {
+            Some(parse_id(tokens)?)
+        } else {
+            None
+        };
         let mut values = Vec::new();
         if tokens.eat(Token::LeftBrace)? {
             loop {
@@ -381,7 +394,12 @@ impl<'a> Resource<'a> {
                 values.push((statik, Value::parse(tokens, docs)?));
             }
         }
-        Ok(Resource { docs, name, values })
+        Ok(Resource {
+            docs,
+            name,
+            supertype,
+            values,
+        })
     }
 }
 
@@ -390,10 +408,10 @@ impl<'a> Value<'a> {
         let name = parse_id(tokens)?;
         tokens.expect(Token::Colon)?;
 
-        let kind = if tokens.eat(Token::Function)? {
+        let kind = if tokens.eat(Token::Func)? {
             parse_func(tokens, false)?
         } else if tokens.eat(Token::Async)? {
-            tokens.expect(Token::Function)?;
+            tokens.expect(Token::Func)?;
             parse_func(tokens, true)?
         } else {
             ValueKind::Global(Type::parse(tokens)?)
@@ -512,6 +530,24 @@ impl<'a> Type<'a> {
                 let err = Box::new(Type::parse(tokens)?);
                 tokens.expect(Token::GreaterThan)?;
                 Ok(Type::Expected(Expected { ok, err }))
+            }
+
+            // future<T>
+            Some((_span, Token::Future)) => {
+                tokens.expect(Token::LessThan)?;
+                let ty = Box::new(Type::parse(tokens)?);
+                tokens.expect(Token::GreaterThan)?;
+                Ok(Type::Future(ty))
+            }
+
+            // stream<T, Z>
+            Some((_span, Token::Stream)) => {
+                tokens.expect(Token::LessThan)?;
+                let element = Box::new(Type::parse(tokens)?);
+                tokens.expect(Token::Comma)?;
+                let end = Box::new(Type::parse(tokens)?);
+                tokens.expect(Token::GreaterThan)?;
+                Ok(Type::Stream(Stream { element, end }))
             }
 
             // `foo`

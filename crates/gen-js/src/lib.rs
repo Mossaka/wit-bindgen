@@ -1,5 +1,6 @@
 use heck::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write;
 use std::mem;
 use wit_bindgen_gen_core::wit_parser::abi::{
     AbiVariant, Bindgen, Bitcast, Instruction, LiftLower, WasmType,
@@ -56,12 +57,12 @@ enum Intrinsic {
     ClampHost,
     ClampHost64,
     DataView,
-    ValidateF32,
-    ValidateF64,
     ValidateGuestChar,
     ValidateHostChar,
     ValidateFlags,
     ValidateFlags64,
+    /// Implementation of https://tc39.es/ecma262/#sec-tostring.
+    ToString,
     I32ToF32,
     F32ToI32,
     I64ToF64,
@@ -82,12 +83,11 @@ impl Intrinsic {
             Intrinsic::ClampHost => "clamp_host",
             Intrinsic::ClampHost64 => "clamp_host64",
             Intrinsic::DataView => "data_view",
-            Intrinsic::ValidateF32 => "validate_f32",
-            Intrinsic::ValidateF64 => "validate_f64",
             Intrinsic::ValidateGuestChar => "validate_guest_char",
             Intrinsic::ValidateHostChar => "validate_host_char",
             Intrinsic::ValidateFlags => "validate_flags",
             Intrinsic::ValidateFlags64 => "validate_flags64",
+            Intrinsic::ToString => "to_string",
             Intrinsic::F32ToI32 => "f32ToI32",
             Intrinsic::I32ToF32 => "i32ToF32",
             Intrinsic::F64ToI64 => "f64ToI64",
@@ -195,6 +195,8 @@ impl Js {
                     }
                     TypeDefKind::Variant(_) => panic!("anonymous variant"),
                     TypeDefKind::List(v) => self.print_list(iface, v),
+                    TypeDefKind::Future(_) => todo!("anonymous future"),
+                    TypeDefKind::Stream(_) => todo!("anonymous stream"),
                 }
             }
         }
@@ -221,16 +223,19 @@ impl Js {
         self.src.ts("]");
     }
 
-    fn docs(&mut self, docs: &Docs) {
-        let docs = match &docs.contents {
-            Some(docs) => docs,
-            None => return,
-        };
+    fn docs_raw(&mut self, docs: &str) {
         self.src.ts("/**\n");
         for line in docs.lines() {
             self.src.ts(&format!(" * {}\n", line));
         }
         self.src.ts(" */\n");
+    }
+
+    fn docs(&mut self, docs: &Docs) {
+        match &docs.contents {
+            Some(docs) => self.docs_raw(docs),
+            None => return,
+        }
     }
 
     fn ts_func(&mut self, iface: &Interface, func: &Function) {
@@ -532,26 +537,38 @@ impl Generator for Js {
         enum_: &Enum,
         docs: &Docs,
     ) {
-        self.docs(docs);
-        self.src
-            .ts(&format!("export enum {} {{\n", name.to_camel_case()));
-        for (i, case) in enum_.cases.iter().enumerate() {
-            self.docs(&case.docs);
-            let name = case.name.to_camel_case();
-            self.src.ts(&format!("{} = {},\n", name, i));
-        }
-        self.src.ts("}\n");
+        // The complete documentation for this enum, including documentation for variants.
+        let mut complete_docs = String::new();
 
-        self.src.js(&format!(
-            "export const {} = Object.freeze({{\n",
-            name.to_camel_case()
-        ));
-        for (i, case) in enum_.cases.iter().enumerate() {
-            let name = case.name.to_camel_case();
-            self.src.js(&format!("{}: \"{}\",\n", i, name));
-            self.src.js(&format!("\"{}\": {},\n", name, i));
+        if let Some(docs) = &docs.contents {
+            complete_docs.push_str(docs);
+            // Add a gap before the `# Variants` section.
+            complete_docs.push('\n');
         }
-        self.src.js("});\n");
+
+        writeln!(complete_docs, "# Variants").unwrap();
+
+        for case in enum_.cases.iter() {
+            writeln!(complete_docs).unwrap();
+            writeln!(complete_docs, "## `\"{}\"`", case.name).unwrap();
+
+            if let Some(docs) = &case.docs.contents {
+                writeln!(complete_docs).unwrap();
+                complete_docs.push_str(docs);
+            }
+        }
+
+        self.docs_raw(&complete_docs);
+
+        self.src
+            .ts(&format!("export type {} = ", name.to_camel_case()));
+        for (i, case) in enum_.cases.iter().enumerate() {
+            if i != 0 {
+                self.src.ts(" | ");
+            }
+            self.src.ts(&format!("\"{}\"", case.name));
+        }
+        self.src.ts(";\n");
     }
 
     fn type_resource(&mut self, _iface: &Interface, ty: ResourceId) {
@@ -1264,7 +1281,7 @@ impl Bindgen for FunctionBindgen<'_> {
         self.blocks.push((src.into(), mem::take(operands)));
     }
 
-    fn return_pointer(&mut self, _size: usize, _align: usize) -> String {
+    fn return_pointer(&mut self, _iface: &Interface, _size: usize, _align: usize) -> String {
         unimplemented!()
     }
 
@@ -1335,18 +1352,9 @@ impl Bindgen for FunctionBindgen<'_> {
                 results.push(operands.pop().unwrap())
             }
 
-            // For f32 coming from the host we need to validate that the value
-            // is indeed a number and that the 32-bit value matches the
-            // original value.
-            Instruction::F32FromFloat32 => {
-                let validate = self.gen.intrinsic(Intrinsic::ValidateF32);
-                results.push(format!("{}({})", validate, operands[0]));
-            }
-
-            // Similar to f32, but no range checks, just checks it's a number
-            Instruction::F64FromFloat64 => {
-                let validate = self.gen.intrinsic(Intrinsic::ValidateF64);
-                results.push(format!("{}({})", validate, operands[0]));
+            Instruction::F32FromFloat32 | Instruction::F64FromFloat64 => {
+                // Use a unary `+` to cast to a float.
+                results.push(format!("+{}", operands[0]));
             }
 
             // Validate that i32 values coming from wasm are indeed valid code
@@ -1910,35 +1918,67 @@ impl Bindgen for FunctionBindgen<'_> {
                 results.push(format!("variant{tmp}"));
             }
 
-            Instruction::EnumLower { name, .. } => {
+            // Lowers an enum in accordance with https://webidl.spec.whatwg.org/#es-enumeration.
+            Instruction::EnumLower { name, enum_, .. } => {
                 let tmp = self.tmp();
-                self.src
-                    .js(&format!("const variant{} = {};\n", tmp, operands[0]));
 
-                let name = name.to_camel_case();
+                let to_string = self.gen.intrinsic(Intrinsic::ToString);
                 self.src
-                    .js(&format!("if (!(variant{} in {}))\n", tmp, name));
-                self.src.js(&format!(
-                    "throw new RangeError(\"invalid variant specified for {}\");\n",
-                    name,
-                ));
-                results.push(format!(
-                    "Number.isInteger(variant{}) ? variant{0} : {}[variant{0}]",
-                    tmp, name
-                ));
+                    .js(&format!("const val{tmp} = {to_string}({});\n", operands[0]));
+
+                // Declare a variable to hold the result.
+                self.src.js(&format!("let enum{tmp};\n"));
+
+                self.src.js(&format!("switch (val{tmp}) {{\n"));
+                for (i, case) in enum_.cases.iter().enumerate() {
+                    self.src.js(&format!(
+                        "\
+                        case \"{case}\": {{
+                            enum{tmp} = {i};
+                            break;
+                        }}
+                        ",
+                        case = case.name
+                    ));
+                }
+                self.src.js(&format!("\
+                        default: {{
+                            throw new TypeError(`\"${{val{tmp}}}\" is not one of the cases of {name}`);
+                        }}
+                    }}
+                "));
+
+                results.push(format!("enum{tmp}"));
             }
 
-            Instruction::EnumLift { name, .. } => {
+            Instruction::EnumLift { name, enum_, .. } => {
                 let tmp = self.tmp();
-                let name = name.to_camel_case();
-                self.src
-                    .js(&format!("const tag{} = {};\n", tmp, operands[0]));
-                self.src.js(&format!("if (!(tag{} in {}))\n", tmp, name));
+
+                self.src.js(&format!("let enum{tmp};\n"));
+
+                self.src.js(&format!("switch ({}) {{\n", operands[0]));
+                for (i, case) in enum_.cases.iter().enumerate() {
+                    self.src.js(&format!(
+                        "\
+                        case {i}: {{
+                            enum{tmp} = \"{case}\";
+                            break;
+                        }}
+                        ",
+                        case = case.name
+                    ));
+                }
                 self.src.js(&format!(
-                    "throw new RangeError(\"invalid discriminant specified for {}\");\n",
-                    name,
+                    "\
+                        default: {{
+                            throw new RangeError(\"invalid discriminant specified for {name}\");
+                        }}
+                    }}
+                    ",
+                    name = name.to_camel_case()
                 ));
-                results.push(format!("tag{}", tmp));
+
+                results.push(format!("enum{tmp}"));
             }
 
             Instruction::ListCanonLower { element, realloc } => {
@@ -2111,7 +2151,7 @@ impl Bindgen for FunctionBindgen<'_> {
             Instruction::IterBasePointer => results.push("base".to_string()),
 
             Instruction::CallWasm {
-                module: _,
+                iface: _,
                 name,
                 sig,
             } => {
@@ -2378,25 +2418,6 @@ impl Js {
                 }
             "),
 
-            // TODO: test removing the isNan test and make sure something fails
-            Intrinsic::ValidateF32 => self.src.js("
-                export function validate_f32(val) {
-                    if (typeof val !== 'number') \
-                        throw new TypeError(`must be a number`);
-                    if (!Number.isNaN(val) && Math.fround(val) !== val) \
-                        throw new RangeError(`must be representable as f32`);
-                    return val;
-                }
-            "),
-
-            Intrinsic::ValidateF64 => self.src.js("
-                export function validate_f64(val) {
-                    if (typeof val !== 'number') \
-                        throw new TypeError(`must be a number`);
-                    return val;
-                }
-            "),
-
             Intrinsic::ValidateGuestChar => self.src.js("
                 export function validate_guest_char(i) {
                     if ((i > 0x10ffff) || (i >= 0xd800 && i <= 0xdfff)) \
@@ -2433,6 +2454,20 @@ impl Js {
                     if ((flags & ~mask) != 0n)
                         throw new TypeError('flags have extraneous bits set');
                     return flags;
+                }
+            "),
+
+            Intrinsic::ToString => self.src.js("
+                export function to_string(val) {
+                    if (typeof val === 'symbol') {
+                        throw new TypeError('symbols cannot be converted to strings');
+                    } else {
+                        // Calling `String` almost directly calls `ToString`, except that it also allows symbols,
+                        // which is why we have the symbol-rejecting branch above.
+                        //
+                        // Definition of `String`: https://tc39.es/ecma262/#sec-string-constructor-string-value
+                        return String(val);
+                    }
                 }
             "),
 

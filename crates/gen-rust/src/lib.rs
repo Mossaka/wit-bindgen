@@ -1,5 +1,7 @@
 use heck::*;
-use std::fmt;
+use std::collections::HashMap;
+use std::fmt::{self, Write};
+use std::iter::zip;
 use wit_bindgen_gen_core::wit_parser::abi::{Bitcast, LiftLower, WasmType};
 use wit_bindgen_gen_core::{wit_parser::*, TypeInfo, Types};
 
@@ -229,6 +231,8 @@ pub trait RustGenerator {
                     | TypeDefKind::Record(_)
                     | TypeDefKind::Option(_)
                     | TypeDefKind::Expected(_)
+                    | TypeDefKind::Future(_)
+                    | TypeDefKind::Stream(_)
                     | TypeDefKind::List(_)
                     | TypeDefKind::Flags(_)
                     | TypeDefKind::Enum(_)
@@ -283,6 +287,18 @@ pub trait RustGenerator {
             }
             TypeDefKind::Union(_) => {
                 panic!("unsupported anonymous type reference: union")
+            }
+            TypeDefKind::Future(ty) => {
+                self.push_str("Future<");
+                self.print_ty(iface, ty, mode);
+                self.push_str(">");
+            }
+            TypeDefKind::Stream(stream) => {
+                self.push_str("Stream<");
+                self.print_ty(iface, &stream.element, mode);
+                self.push_str(",");
+                self.print_ty(iface, &stream.end, mode);
+                self.push_str(">");
             }
 
             TypeDefKind::Type(t) => self.print_ty(iface, t, mode),
@@ -375,6 +391,111 @@ pub trait RustGenerator {
         return result;
     }
 
+    /// Writes the camel-cased 'name' of the passed type to `out`, as used to name union variants.
+    fn write_name(&self, iface: &Interface, ty: &Type, out: &mut String) {
+        match ty {
+            Type::Unit => out.push_str("Unit"),
+            Type::Bool => out.push_str("Bool"),
+            Type::U8 => out.push_str("U8"),
+            Type::U16 => out.push_str("U16"),
+            Type::U32 => out.push_str("U32"),
+            Type::U64 => out.push_str("U64"),
+            Type::S8 => out.push_str("I8"),
+            Type::S16 => out.push_str("I16"),
+            Type::S32 => out.push_str("I32"),
+            Type::S64 => out.push_str("I64"),
+            Type::Float32 => out.push_str("F32"),
+            Type::Float64 => out.push_str("F64"),
+            Type::Char => out.push_str("Char"),
+            Type::String => out.push_str("String"),
+            Type::Handle(id) => out.push_str(&iface.resources[*id].name.to_camel_case()),
+            Type::Id(id) => {
+                let ty = &iface.types[*id];
+                match &ty.name {
+                    Some(name) => out.push_str(&name.to_camel_case()),
+                    None => match &ty.kind {
+                        TypeDefKind::Option(ty) => {
+                            out.push_str("Optional");
+                            self.write_name(iface, ty, out);
+                        }
+                        TypeDefKind::Expected(_) => out.push_str("Result"),
+                        TypeDefKind::Tuple(_) => out.push_str("Tuple"),
+                        TypeDefKind::List(ty) => {
+                            self.write_name(iface, ty, out);
+                            out.push_str("List")
+                        }
+                        TypeDefKind::Future(ty) => {
+                            self.write_name(iface, ty, out);
+                            out.push_str("Future");
+                        }
+                        TypeDefKind::Stream(s) => {
+                            self.write_name(iface, &s.element, out);
+                            self.write_name(iface, &s.end, out);
+                            out.push_str("Stream");
+                        }
+
+                        TypeDefKind::Type(ty) => self.write_name(iface, ty, out),
+                        TypeDefKind::Record(_) => out.push_str("Record"),
+                        TypeDefKind::Flags(_) => out.push_str("Flags"),
+                        TypeDefKind::Variant(_) => out.push_str("Variant"),
+                        TypeDefKind::Enum(_) => out.push_str("Enum"),
+                        TypeDefKind::Union(_) => out.push_str("Union"),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Returns the names for the cases of the passed union.
+    fn union_case_names(&self, iface: &Interface, union: &Union) -> Vec<String> {
+        enum UsedState<'a> {
+            /// This name has been used once before.
+            ///
+            /// Contains a reference to the name given to the first usage so that a suffix can be added to it.
+            Once(&'a mut String),
+            /// This name has already been used multiple times.
+            ///
+            /// Contains the number of times this has already been used.
+            Multiple(usize),
+        }
+
+        // A `Vec` of the names we're assigning each of the union's cases in order.
+        let mut case_names = vec![String::new(); union.cases.len()];
+        // A map from case names to their `UsedState`.
+        let mut used = HashMap::new();
+        for (case, name) in union.cases.iter().zip(case_names.iter_mut()) {
+            self.write_name(iface, &case.ty, name);
+
+            match used.get_mut(name.as_str()) {
+                None => {
+                    // Initialise this name's `UsedState`, with a mutable reference to this name
+                    // in case we have to add a suffix to it later.
+                    used.insert(name.clone(), UsedState::Once(name));
+                    // Since this is the first (and potentially only) usage of this name,
+                    // we don't need to add a suffix here.
+                }
+                Some(state) => match state {
+                    UsedState::Multiple(n) => {
+                        // Add a suffix of the index of this usage.
+                        write!(name, "{n}").unwrap();
+                        // Add one to the number of times this type has been used.
+                        *n += 1;
+                    }
+                    UsedState::Once(first) => {
+                        // Add a suffix of 0 to the first usage.
+                        first.push('0');
+                        // We now get a suffix of 1.
+                        name.push('1');
+                        // Then update the state.
+                        *state = UsedState::Multiple(2);
+                    }
+                },
+            }
+        }
+
+        case_names
+    }
+
     fn print_typedef_record(
         &mut self,
         iface: &Interface,
@@ -407,11 +528,13 @@ pub trait RustGenerator {
 
             self.push_str("impl");
             self.print_generics(&info, lt, true);
-            self.push_str(" std::fmt::Debug for ");
+            self.push_str(" core::fmt::Debug for ");
             self.push_str(&name);
             self.print_generics(&info, lt, false);
             self.push_str(" {\n");
-            self.push_str("fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+            self.push_str(
+                "fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n",
+            );
             self.push_str(&format!("f.debug_struct(\"{}\")", name));
             for field in record.fields.iter() {
                 self.push_str(&format!(
@@ -469,11 +592,8 @@ pub trait RustGenerator {
         self.print_rust_enum(
             iface,
             id,
-            union
-                .cases
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (format!("V{i}"), &c.docs, &c.ty)),
+            zip(self.union_case_names(iface, union), &union.cases)
+                .map(|(name, case)| (name, &case.docs, &case.ty)),
             docs,
         );
     }
@@ -538,11 +658,11 @@ pub trait RustGenerator {
         let lt = self.lifetime_for(&info, mode);
         self.push_str("impl");
         self.print_generics(&info, lt, true);
-        self.push_str(" std::fmt::Debug for ");
+        self.push_str(" core::fmt::Debug for ");
         self.push_str(name);
         self.print_generics(&info, lt, false);
         self.push_str(" {\n");
-        self.push_str("fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+        self.push_str("fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n");
         self.push_str("match self {\n");
         for (case_name, payload) in cases {
             self.push_str(name);
@@ -657,10 +777,10 @@ pub trait RustGenerator {
 
             self.push_str("}\n");
 
-            self.push_str("impl std::fmt::Debug for ");
+            self.push_str("impl core::fmt::Debug for ");
             self.push_str(&name);
             self.push_str(
-                "{\nfn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n",
+                "{\nfn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n",
             );
             self.push_str("f.debug_struct(\"");
             self.push_str(&name);
@@ -672,10 +792,10 @@ pub trait RustGenerator {
             self.push_str("}\n");
             self.push_str("}\n");
 
-            self.push_str("impl std::fmt::Display for ");
+            self.push_str("impl core::fmt::Display for ");
             self.push_str(&name);
             self.push_str(
-                "{\nfn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n",
+                "{\nfn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n",
             );
             self.push_str("write!(f, \"{} (error {})\", self.name(), *self as i32)");
             self.push_str("}\n");
@@ -895,12 +1015,58 @@ pub trait RustFunctionGenerator {
 
 pub fn to_rust_ident(name: &str) -> String {
     match name {
+        // Escape Rust keywords.
+        // Source: https://doc.rust-lang.org/reference/keywords.html
+        "as" => "as_".into(),
+        "break" => "break_".into(),
+        "const" => "const_".into(),
+        "continue" => "continue_".into(),
+        "crate" => "crate_".into(),
+        "else" => "else_".into(),
+        "enum" => "enum_".into(),
+        "extern" => "extern_".into(),
+        "false" => "false_".into(),
+        "fn" => "fn_".into(),
+        "for" => "for_".into(),
+        "if" => "if_".into(),
+        "impl" => "impl_".into(),
         "in" => "in_".into(),
-        "type" => "type_".into(),
-        "where" => "where_".into(),
-        "yield" => "yield_".into(),
-        "async" => "async_".into(),
+        "let" => "let_".into(),
+        "loop" => "loop_".into(),
+        "match" => "match_".into(),
+        "mod" => "mod_".into(),
+        "move" => "move_".into(),
+        "mut" => "mut_".into(),
+        "pub" => "pub_".into(),
+        "ref" => "ref_".into(),
+        "return" => "return_".into(),
         "self" => "self_".into(),
+        "static" => "static_".into(),
+        "struct" => "struct_".into(),
+        "super" => "super_".into(),
+        "trait" => "trait_".into(),
+        "true" => "true_".into(),
+        "type" => "type_".into(),
+        "unsafe" => "unsafe_".into(),
+        "use" => "use_".into(),
+        "where" => "where_".into(),
+        "while" => "while_".into(),
+        "async" => "async_".into(),
+        "await" => "await_".into(),
+        "dyn" => "dyn_".into(),
+        "abstract" => "abstract_".into(),
+        "become" => "become_".into(),
+        "box" => "box_".into(),
+        "do" => "do_".into(),
+        "final" => "final_".into(),
+        "macro" => "macro_".into(),
+        "override" => "override_".into(),
+        "priv" => "priv_".into(),
+        "typeof" => "typeof_".into(),
+        "unsized" => "unsized_".into(),
+        "virtual" => "virtual_".into(),
+        "yield" => "yield_".into(),
+        "try" => "try_".into(),
         s => s.to_snake_case(),
     }
 }

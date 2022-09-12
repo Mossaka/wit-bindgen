@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::collections::{btree_map::Entry, BTreeMap, HashMap};
+use std::fmt::{self, Write};
 use std::ops::Deref;
 use std::path::Path;
 use wit_parser::*;
@@ -87,9 +88,15 @@ pub trait Generator {
     fn type_alias(&mut self, iface: &Interface, id: TypeId, name: &str, ty: &Type, docs: &Docs);
     fn type_list(&mut self, iface: &Interface, id: TypeId, name: &str, ty: &Type, docs: &Docs);
     fn type_builtin(&mut self, iface: &Interface, id: TypeId, name: &str, ty: &Type, docs: &Docs);
-    // fn const_(&mut self, iface: &Interface, name: &str, ty: &str, val: u64, docs: &Docs);
+
+    fn preprocess_functions(&mut self, iface: &Interface, dir: Direction) {
+        drop((iface, dir));
+    }
     fn import(&mut self, iface: &Interface, func: &Function);
     fn export(&mut self, iface: &Interface, func: &Function);
+    fn finish_functions(&mut self, iface: &Interface, dir: Direction) {
+        drop((iface, dir));
+    }
 
     fn finish_one(&mut self, iface: &Interface, files: &mut Files);
 
@@ -119,6 +126,8 @@ pub trait Generator {
                 TypeDefKind::Union(u) => self.type_union(iface, id, name, u, &ty.docs),
                 TypeDefKind::List(t) => self.type_list(iface, id, name, t, &ty.docs),
                 TypeDefKind::Type(t) => self.type_alias(iface, id, name, t, &ty.docs),
+                TypeDefKind::Future(_) => todo!("generate for future"),
+                TypeDefKind::Stream(_) => todo!("generate for stream"),
             }
         }
 
@@ -126,9 +135,7 @@ pub trait Generator {
             self.type_resource(iface, id);
         }
 
-        // for c in module.constants() {
-        //     self.const_(&c.name, &c.ty, c.value, &c.docs);
-        // }
+        self.preprocess_functions(iface, dir);
 
         for f in iface.functions.iter() {
             match dir {
@@ -136,6 +143,8 @@ pub trait Generator {
                 Direction::Export => self.export(iface, &f),
             }
         }
+
+        self.finish_functions(iface, dir);
 
         self.finish_one(iface, files)
     }
@@ -245,6 +254,13 @@ impl Types {
                     info |= self.type_info(iface, &case.ty);
                 }
             }
+            TypeDefKind::Future(ty) => {
+                info = self.type_info(iface, ty);
+            }
+            TypeDefKind::Stream(stream) => {
+                info = self.type_info(iface, &stream.element);
+                info |= self.type_info(iface, &stream.end);
+            }
         }
         self.type_info.insert(ty, info);
         return info;
@@ -291,6 +307,11 @@ impl Types {
                 for case in u.cases.iter() {
                     self.set_param_result_ty(iface, &case.ty, param, result)
                 }
+            }
+            TypeDefKind::Future(ty) => self.set_param_result_ty(iface, ty, param, result),
+            TypeDefKind::Stream(stream) => {
+                self.set_param_result_ty(iface, &stream.element, param, result);
+                self.set_param_result_ty(iface, &stream.end, param, result);
             }
         }
     }
@@ -389,6 +410,13 @@ impl Source {
     }
 }
 
+impl Write for Source {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.push_str(s);
+        Ok(())
+    }
+}
+
 impl Deref for Source {
     type Target = str;
     fn deref(&self) -> &str {
@@ -400,6 +428,32 @@ impl From<Source> for String {
     fn from(s: Source) -> String {
         s.s
     }
+}
+
+/// Calls [`write!`] with the passed arguments and unwraps the result.
+///
+/// Useful for writing to things with infallible `Write` implementations like
+/// `Source` and `String`.
+///
+/// [`write!`]: std::write
+#[macro_export]
+macro_rules! uwrite {
+    ($dst:expr, $($arg:tt)*) => {
+        write!($dst, $($arg)*).unwrap()
+    };
+}
+
+/// Calls [`writeln!`] with the passed arguments and unwraps the result.
+///
+/// Useful for writing to things with infallible `Write` implementations like
+/// `Source` and `String`.
+///
+/// [`writeln!`]: std::writeln
+#[macro_export]
+macro_rules! uwriteln {
+    ($dst:expr, $($arg:tt)*) => {
+        writeln!($dst, $($arg)*).unwrap()
+    };
 }
 
 #[cfg(test)]

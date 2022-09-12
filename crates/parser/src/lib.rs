@@ -19,6 +19,14 @@ pub fn validate_id(s: &str) -> Result<()> {
 #[derive(Debug, Default)]
 pub struct Interface {
     pub name: String,
+    /// The module name to use for bindings generation.
+    ///
+    /// If `None`, then the interface name will be used.
+    ///
+    /// If `Some`, then this value is used to format an export
+    /// name of `<module>#<name>` for exports or an import module
+    /// name of `<module>` for imports.
+    pub module: Option<String>,
     pub types: Arena<TypeDef>,
     pub type_lookup: HashMap<String, TypeId>,
     pub resources: Arena<Resource>,
@@ -54,6 +62,8 @@ pub enum TypeDefKind {
     Expected(Expected),
     Union(Union),
     List(Type),
+    Future(Type),
+    Stream(Stream),
     Type(Type),
 }
 
@@ -213,6 +223,12 @@ impl Union {
     }
 }
 
+#[derive(Debug)]
+pub struct Stream {
+    pub element: Type,
+    pub end: Type,
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct Docs {
     pub contents: Option<String>,
@@ -222,6 +238,7 @@ pub struct Docs {
 pub struct Resource {
     pub docs: Docs,
     pub name: String,
+    pub supertype: Option<String>,
     /// `None` if this resource is defined within the containing instance,
     /// otherwise `Some` if it's defined in an instance named here.
     pub foreign_module: Option<String>,
@@ -324,7 +341,15 @@ impl Interface {
         visiting: &mut HashSet<PathBuf>,
         map: &mut HashMap<String, Interface>,
     ) -> Result<Interface> {
-        let mut name = filename.file_stem().unwrap();
+        let name = filename
+            .file_name()
+            .context("wit path must end in a file name")?
+            .to_str()
+            .context("wit filename must be valid unicode")?
+            // TODO: replace with `file_prefix` if/when that gets stabilized.
+            .split(".")
+            .next()
+            .unwrap();
         let mut contents = contents;
 
         // If we have a ".md" file, it's a wit file wrapped in a markdown file;
@@ -333,9 +358,6 @@ impl Interface {
         if filename.extension().and_then(|s| s.to_str()) == Some("md") {
             md_contents = unwrap_md(contents);
             contents = &md_contents[..];
-
-            // Also strip the inner ".wit" extension.
-            name = Path::new(name).file_stem().unwrap();
         }
 
         // Parse the `contents `into an AST
@@ -369,7 +391,7 @@ impl Interface {
         visiting.remove(filename);
 
         // and finally resolve everything into our final instance
-        match ast.resolve(name.to_str().unwrap(), map) {
+        match ast.resolve(name, map) {
             Ok(i) => Ok(i),
             Err(mut e) => {
                 let file = filename.display().to_string();
@@ -420,6 +442,13 @@ impl Interface {
                     self.topo_visit_ty(&t.ty, list, visited);
                 }
             }
+            TypeDefKind::Future(ty) => {
+                self.topo_visit_ty(ty, list, visited);
+            }
+            TypeDefKind::Stream(s) => {
+                self.topo_visit_ty(&s.element, list, visited);
+                self.topo_visit_ty(&s.end, list, visited);
+            }
         }
         list.push(id);
     }
@@ -452,6 +481,8 @@ impl Interface {
                 | TypeDefKind::Enum(_)
                 | TypeDefKind::Option(_)
                 | TypeDefKind::Expected(_)
+                | TypeDefKind::Future(_)
+                | TypeDefKind::Stream(_)
                 | TypeDefKind::Union(_) => false,
                 TypeDefKind::Type(t) => self.all_bits_valid(t),
                 TypeDefKind::Record(r) => r.fields.iter().all(|f| self.all_bits_valid(&f.ty)),
@@ -479,7 +510,20 @@ impl Interface {
 
 fn load_fs(root: &Path, name: &str) -> Result<(PathBuf, String)> {
     let wit = root.join(name).with_extension("wit");
-    let contents =
-        fs::read_to_string(&wit).context(format!("failed to read `{}`", wit.display()))?;
-    Ok((wit, contents))
+
+    // Attempt to read a ".wit" file.
+    match fs::read_to_string(&wit) {
+        Ok(contents) => Ok((wit, contents)),
+
+        // If no such file was found, attempt to read a ".wit.md" file.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let wit_md = wit.with_extension("wit.md");
+            match fs::read_to_string(&wit_md) {
+                Ok(contents) => Ok((wit_md, contents)),
+                Err(_err) => Err(err.into()),
+            }
+        }
+
+        Err(err) => return Err(err.into()),
+    }
 }

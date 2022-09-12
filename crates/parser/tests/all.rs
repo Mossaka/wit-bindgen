@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -118,7 +119,18 @@ impl Runner<'_> {
             to_json(&instance)
         };
 
-        let result_file = test.with_extension("wit.result");
+        // "foo.wit" => "foo.wit.result"
+        // "foo.wit.md" => "foo.wit.md.result"
+        let result_file = if test.extension() == Some(OsStr::new("md"))
+            && test
+                .file_stem()
+                .and_then(|path| Path::new(path).extension())
+                == Some(OsStr::new("wit"))
+        {
+            test.with_extension("md.result")
+        } else {
+            test.with_extension("wit.result")
+        };
         if env::var_os("BLESS").is_some() {
             fs::write(&result_file, result)?;
         } else {
@@ -170,6 +182,8 @@ fn to_json(i: &Interface) -> String {
     struct Resource {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        supertype: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         foreign_module: Option<String>,
     }
 
@@ -195,6 +209,8 @@ fn to_json(i: &Interface) -> String {
         Tuple { types: Vec<String> },
         Option(String),
         Expected { ok: String, err: String },
+        Future(String),
+        Stream { element: String, end: String },
         List(String),
         Union { cases: Vec<String> },
     }
@@ -219,6 +235,7 @@ fn to_json(i: &Interface) -> String {
         .iter()
         .map(|(_, r)| Resource {
             name: r.name.clone(),
+            supertype: r.supertype.as_ref().map(|supertype| supertype.clone()),
             foreign_module: r.foreign_module.clone(),
         })
         .collect::<Vec<_>>();
@@ -290,6 +307,11 @@ fn to_json(i: &Interface) -> String {
             TypeDefKind::Expected(e) => Type::Expected {
                 ok: translate_type(&e.ok),
                 err: translate_type(&e.err),
+            },
+            TypeDefKind::Future(t) => Type::Future(translate_type(t)),
+            TypeDefKind::Stream(s) => Type::Stream {
+                element: translate_type(&s.element),
+                end: translate_type(&s.end),
             },
             TypeDefKind::List(ty) => Type::List(translate_type(ty)),
             TypeDefKind::Union(u) => Type::Union {

@@ -1,6 +1,6 @@
 [package]
 name = "wit-bindgen-cli"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Alex Crichton <alex@alexcrichton.com>"]
 edition = "2018"
 
@@ -8,9 +8,7 @@ edition = "2018"
 members = [
   "crates/test-rust-wasm",
   "crates/wit-bindgen-demo",
-  "crates/wasmlink-cli",
   "crates/wit-component",
-  "crates/test-modules",
 ]
 resolver = "2"
 

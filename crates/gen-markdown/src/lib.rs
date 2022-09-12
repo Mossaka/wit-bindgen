@@ -102,6 +102,18 @@ impl Markdown {
                         self.print_ty(iface, t, false);
                         self.src.push_str(">");
                     }
+                    TypeDefKind::Future(t) => {
+                        self.src.push_str("future<");
+                        self.print_ty(iface, t, false);
+                        self.src.push_str(">");
+                    }
+                    TypeDefKind::Stream(s) => {
+                        self.src.push_str("stream<");
+                        self.print_ty(iface, &s.element, false);
+                        self.src.push_str(", ");
+                        self.print_ty(iface, &s.end, false);
+                        self.src.push_str(">");
+                    }
                 }
             }
         }

@@ -28,6 +28,8 @@ enum Key {
     Option(Type),
     Expected(Type, Type),
     Union(Vec<Type>),
+    Future(Type),
+    Stream(Type, Type),
 }
 
 impl Resolver {
@@ -76,6 +78,7 @@ impl Resolver {
 
         Ok(Interface {
             name: name.to_string(),
+            module: None,
             types: mem::take(&mut self.types),
             type_lookup: mem::take(&mut self.type_lookup),
             resources: mem::take(&mut self.resources),
@@ -172,6 +175,7 @@ impl Resolver {
                 let resource = Resource {
                     docs: r.docs.clone(),
                     name: r.name.clone(),
+                    supertype: r.supertype.clone(),
                     foreign_module: Some(
                         r.foreign_module
                             .clone()
@@ -247,6 +251,11 @@ impl Resolver {
                         })
                         .collect(),
                 }),
+                TypeDefKind::Future(t) => TypeDefKind::Future(self.copy_type(dep_name, dep, *t)),
+                TypeDefKind::Stream(e) => TypeDefKind::Stream(Stream {
+                    element: self.copy_type(dep_name, dep, e.element),
+                    end: self.copy_type(dep_name, dep, e.end),
+                }),
             },
         };
         let id = self.types.alloc(ty);
@@ -271,6 +280,10 @@ impl Resolver {
                     let id = self.resources.alloc(Resource {
                         docs,
                         name: r.name.name.to_string(),
+                        supertype: r
+                            .supertype
+                            .as_ref()
+                            .map(|supertype| supertype.name.to_string()),
                         foreign_module: None,
                     });
                     self.define_resource(&r.name.name, r.name.span, id)?;
@@ -483,6 +496,11 @@ impl Resolver {
                     .collect::<Result<Vec<_>>>()?;
                 TypeDefKind::Union(Union { cases })
             }
+            super::Type::Future(t) => TypeDefKind::Future(self.resolve_type(t)?),
+            super::Type::Stream(s) => TypeDefKind::Stream(Stream {
+                element: self.resolve_type(&s.element)?,
+                end: self.resolve_type(&s.end)?,
+            }),
         })
     }
 
@@ -522,6 +540,8 @@ impl Resolver {
             TypeDefKind::Option(t) => Key::Option(*t),
             TypeDefKind::Expected(e) => Key::Expected(e.ok, e.err),
             TypeDefKind::Union(u) => Key::Union(u.cases.iter().map(|c| c.ty).collect()),
+            TypeDefKind::Future(ty) => Key::Future(*ty),
+            TypeDefKind::Stream(s) => Key::Stream(s.element, s.end),
         };
         let types = &mut self.types;
         let id = self
@@ -532,26 +552,28 @@ impl Resolver {
     }
 
     fn docs(&mut self, doc: &super::Docs<'_>) -> Docs {
-        if doc.docs.is_empty() {
-            return Docs { contents: None };
-        }
-        let mut docs = String::new();
+        let mut docs = None;
         for doc in doc.docs.iter() {
             // Comments which are not doc-comments are silently ignored
             if let Some(doc) = doc.strip_prefix("///") {
+                let docs = docs.get_or_insert_with(String::new);
                 docs.push_str(doc.trim_start_matches('/').trim());
                 docs.push('\n');
-            } else if let Some(doc) = doc.strip_prefix("/**") {
-                assert!(doc.ends_with("*/"));
-                for line in doc[..doc.len() - 2].lines() {
-                    docs.push_str(line);
-                    docs.push('\n');
+            } else if let Some(doc) = doc.strip_prefix("/*") {
+                // We have to strip this before checking if this is a doc
+                // comment to avoid breaking on empty block comments, `/**/`.
+                let doc = doc.strip_suffix("*/").unwrap();
+
+                if let Some(doc) = doc.strip_prefix("*") {
+                    let docs = docs.get_or_insert_with(String::new);
+                    for line in doc.lines() {
+                        docs.push_str(line);
+                        docs.push('\n');
+                    }
                 }
             }
         }
-        Docs {
-            contents: Some(docs),
-        }
+        Docs { contents: docs }
     }
 
     fn resolve_value(&mut self, value: &Value<'_>) -> Result<()> {
@@ -697,6 +719,19 @@ impl Resolver {
                     self.validate_type_not_recursive(span, id, visiting, valid)?
                 }
                 if let Type::Id(id) = e.err {
+                    self.validate_type_not_recursive(span, id, visiting, valid)?
+                }
+            }
+            TypeDefKind::Future(t) => {
+                if let Type::Id(id) = *t {
+                    self.validate_type_not_recursive(span, id, visiting, valid)?
+                }
+            }
+            TypeDefKind::Stream(s) => {
+                if let Type::Id(id) = s.element {
+                    self.validate_type_not_recursive(span, id, visiting, valid)?
+                }
+                if let Type::Id(id) = s.end {
                     self.validate_type_not_recursive(span, id, visiting, valid)?
                 }
             }

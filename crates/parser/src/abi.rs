@@ -640,7 +640,7 @@ def_instruction! {
         /// functions, instead `CallWasmAsyncImport` and `CallWasmAsyncExport`
         /// are used.
         CallWasm {
-            module: &'a str,
+            iface: &'a Interface,
             name: &'a str,
             sig: &'a WasmSignature,
         } : [sig.params.len()] => [sig.results.len()],
@@ -660,7 +660,7 @@ def_instruction! {
         /// It's up to the bindings generator to figure out how to make this
         /// look synchronous despite it being callback-based in the middle.
         CallWasmAsyncImport {
-            module: &'a str,
+            iface: &'a Interface,
             name: &'a str,
             params: &'a [WasmType],
             results: &'a [WasmType],
@@ -795,12 +795,10 @@ pub enum LiftLower {
 /// the way the resulting bindings will be used by end users. See the comments
 /// on the `Direction` enum in gen-core for details.
 ///
-/// The bindings ABI has a concept of a "guest" and a "host". Wasmlink can
-/// generate glue to bridge between two "guests", but in that case each side
-/// thinks of the glue as the "host". There are two variants of the ABI,
-/// one specialized for the "guest" importing and calling a function defined
-/// and exported in the "host", and the other specialized for the "host"
-/// importing and calling a fuinction defined and exported in the "guest".
+/// The bindings ABI has a concept of a "guest" and a "host". There are two
+/// variants of the ABI, one specialized for the "guest" importing and calling
+/// a function defined and exported in the "host", and the other specialized for
+/// the "host" importing and calling a function defined and exported in the "guest".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AbiVariant {
     /// The guest is importing and calling the function.
@@ -843,8 +841,10 @@ pub trait Bindgen {
         results: &mut Vec<Self::Operand>,
     );
 
-    /// TODO
-    fn return_pointer(&mut self, size: usize, align: usize) -> Self::Operand;
+    /// Gets a operand reference to the return pointer area.
+    ///
+    /// The provided size and alignment is for the function's return type.
+    fn return_pointer(&mut self, iface: &Interface, size: usize, align: usize) -> Self::Operand;
 
     /// Enters a new block of code to generate code for.
     ///
@@ -1025,6 +1025,14 @@ impl Interface {
                     result.push(WasmType::I32);
                     self.push_wasm_variants(variant, u.cases.iter().map(|c| &c.ty), result);
                 }
+
+                TypeDefKind::Future(_) => {
+                    result.push(WasmType::I32);
+                }
+
+                TypeDefKind::Stream(_) => {
+                    result.push(WasmType::I32);
+                }
             },
         }
     }
@@ -1136,7 +1144,9 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                     let ptr = match self.variant {
                         // When a wasm module calls an import it will provide
                         // static space that isn't dynamically allocated.
-                        AbiVariant::GuestImport => self.bindgen.return_pointer(size, align),
+                        AbiVariant::GuestImport => {
+                            self.bindgen.return_pointer(self.iface, size, align)
+                        }
                         // When calling a wasm module from the outside, though,
                         // malloc needs to be called.
                         AbiVariant::GuestExport => {
@@ -1173,7 +1183,7 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                         AbiVariant::GuestImport => {
                             assert_eq!(self.stack.len(), sig.params.len() - 2);
                             self.emit(&Instruction::CallWasmAsyncImport {
-                                module: &self.iface.name,
+                                iface: self.iface,
                                 name: &func.name,
                                 params: &sig.params,
                                 results: &results,
@@ -1197,7 +1207,7 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                     if self.variant == AbiVariant::GuestImport && sig.retptr {
                         let size = self.bindgen.sizes().size(&func.result);
                         let align = self.bindgen.sizes().align(&func.result);
-                        let ptr = self.bindgen.return_pointer(size, align);
+                        let ptr = self.bindgen.return_pointer(self.iface, size, align);
                         self.return_pointer = Some(ptr.clone());
                         self.stack.push(ptr);
                     }
@@ -1206,7 +1216,7 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                     // actual wasm function.
                     assert_eq!(self.stack.len(), sig.params.len());
                     self.emit(&Instruction::CallWasm {
-                        module: &self.iface.name,
+                        iface: self.iface,
                         name: &func.name,
                         sig: &sig,
                     });
@@ -1327,7 +1337,7 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                         AbiVariant::GuestExport => {
                             let size = self.bindgen.sizes().size(&func.result);
                             let align = self.bindgen.sizes().align(&func.result);
-                            let ptr = self.bindgen.return_pointer(size, align);
+                            let ptr = self.bindgen.return_pointer(self.iface, size, align);
                             self.write_to_memory(&func.result, ptr.clone(), 0);
 
                             // Get the caller's context index.
@@ -1370,7 +1380,7 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                             AbiVariant::GuestExport => {
                                 let size = self.bindgen.sizes().size(&func.result);
                                 let align = self.bindgen.sizes().align(&func.result);
-                                let ptr = self.bindgen.return_pointer(size, align);
+                                let ptr = self.bindgen.return_pointer(self.iface, size, align);
                                 self.write_to_memory(&func.result, ptr.clone(), 0);
                                 self.stack.push(ptr);
                             }
@@ -1582,6 +1592,8 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                         name: self.iface.types[id].name.as_deref().unwrap(),
                     });
                 }
+                TypeDefKind::Future(_) => todo!("lower future"),
+                TypeDefKind::Stream(_) => todo!("lower stream"),
             },
         }
     }
@@ -1789,6 +1801,9 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                         name: self.iface.types[id].name.as_deref().unwrap(),
                     });
                 }
+
+                TypeDefKind::Future(_) => todo!("lift future"),
+                TypeDefKind::Stream(_) => todo!("lift stream"),
             },
         }
     }
@@ -1958,6 +1973,9 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                         name: self.iface.types[id].name.as_deref().unwrap(),
                     });
                 }
+
+                TypeDefKind::Future(_) => todo!("write future to memory"),
+                TypeDefKind::Stream(_) => todo!("write stream to memory"),
             },
         }
     }
@@ -2134,6 +2152,9 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                         name: self.iface.types[id].name.as_deref().unwrap(),
                     });
                 }
+
+                TypeDefKind::Future(_) => todo!("read future from memory"),
+                TypeDefKind::Stream(_) => todo!("read stream from memory"),
             },
         }
     }

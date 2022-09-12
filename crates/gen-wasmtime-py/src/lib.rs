@@ -6,6 +6,12 @@ use wit_bindgen_gen_core::wit_parser::abi::{
 };
 use wit_bindgen_gen_core::{wit_parser::*, Direction, Files, Generator, Ns};
 
+pub mod dependencies;
+pub mod source;
+
+use dependencies::Dependencies;
+use source::Source;
+
 #[derive(Default)]
 pub struct WasmtimePy {
     src: Source,
@@ -14,21 +20,18 @@ pub struct WasmtimePy {
     guest_imports: HashMap<String, Imports>,
     guest_exports: HashMap<String, Exports>,
     sizes: SizeAlign,
-    needs_clamp: bool,
-    needs_store: bool,
-    needs_load: bool,
-    needs_validate_guest_char: bool,
-    needs_expected: bool,
-    needs_i32_to_f32: bool,
-    needs_f32_to_i32: bool,
-    needs_i64_to_f64: bool,
-    needs_f64_to_i64: bool,
-    needs_decode_utf8: bool,
-    needs_encode_utf8: bool,
-    needs_list_canon_lift: bool,
-    needs_list_canon_lower: bool,
-    needs_t_typevar: bool,
-    pyimports: BTreeMap<String, Option<BTreeSet<String>>>,
+    /// Tracks the intrinsics and Python imports needed
+    deps: Dependencies,
+    /// Whether the Python Union being emited will wrap its cases with dataclasses
+    union_representation: HashMap<String, PyUnionRepresentation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PyUnionRepresentation {
+    /// A union whose inner types are used directly
+    Raw,
+    /// A union whose inner types have been wrapped in dataclasses
+    Wrapped,
 }
 
 #[derive(Default)]
@@ -86,476 +89,36 @@ impl WasmtimePy {
         }
     }
 
-    fn indent(&mut self) {
-        self.src.indent(2);
-    }
-
-    fn deindent(&mut self) {
-        self.src.deindent(2);
-    }
-
-    fn print_intrinsics(&mut self, iface: &Interface) {
-        if self.needs_clamp {
-            self.src.push_str(
-                "
-                    def _clamp(i: int, min: int, max: int) -> int:
-                        if i < min or i > max:
-                            raise OverflowError(f'must be between {min} and {max}')
-                        return i
-                ",
-            );
-        }
-        if self.needs_store {
-            // TODO: this uses native endianness
-            self.pyimport("ctypes", None);
-            self.src.push_str(
-                "
-                    def _store(ty: Any, mem: wasmtime.Memory, store: wasmtime.Storelike, base: int, offset: int, val: Any) -> None:
-                        ptr = (base & 0xffffffff) + offset
-                        if ptr + ctypes.sizeof(ty) > mem.data_len(store):
-                            raise IndexError('out-of-bounds store')
-                        raw_base = mem.data_ptr(store)
-                        c_ptr = ctypes.POINTER(ty)(
-                            ty.from_address(ctypes.addressof(raw_base.contents) + ptr)
-                        )
-                        c_ptr[0] = val
-                ",
-            );
-        }
-        if self.needs_load {
-            // TODO: this uses native endianness
-            self.pyimport("ctypes", None);
-            self.src.push_str(
-                "
-                    def _load(ty: Any, mem: wasmtime.Memory, store: wasmtime.Storelike, base: int, offset: int) -> Any:
-                        ptr = (base & 0xffffffff) + offset
-                        if ptr + ctypes.sizeof(ty) > mem.data_len(store):
-                            raise IndexError('out-of-bounds store')
-                        raw_base = mem.data_ptr(store)
-                        c_ptr = ctypes.POINTER(ty)(
-                            ty.from_address(ctypes.addressof(raw_base.contents) + ptr)
-                        )
-                        return c_ptr[0]
-                ",
-            );
-        }
-        if self.needs_validate_guest_char {
-            self.src.push_str(
-                "
-                    def _validate_guest_char(i: int) -> str:
-                        if i > 0x10ffff or (i >= 0xd800 and i <= 0xdfff):
-                            raise TypeError('not a valid char');
-                        return chr(i)
-                ",
-            );
-        }
-        if self.needs_expected {
-            self.pyimport("dataclasses", "dataclass");
-            self.pyimport("typing", "TypeVar");
-            self.pyimport("typing", "Generic");
-            self.pyimport("typing", "Union");
-            self.needs_t_typevar = true;
-            self.src.push_str(
-                "
-                    @dataclass
-                    class Ok(Generic[T]):
-                        value: T
-                    E = TypeVar('E')
-                    @dataclass
-                    class Err(Generic[E]):
-                        value: E
-
-                    Expected = Union[Ok[T], Err[E]]
-                ",
-            );
-        }
-        if self.needs_i32_to_f32 || self.needs_f32_to_i32 {
-            self.pyimport("ctypes", None);
-            self.src
-                .push_str("_i32_to_f32_i32 = ctypes.pointer(ctypes.c_int32(0))\n");
-            self.src.push_str(
-                "_i32_to_f32_f32 = ctypes.cast(_i32_to_f32_i32, ctypes.POINTER(ctypes.c_float))\n",
-            );
-            if self.needs_i32_to_f32 {
-                self.src.push_str(
-                    "
-                        def _i32_to_f32(i: int) -> float:
-                            _i32_to_f32_i32[0] = i     # type: ignore
-                            return _i32_to_f32_f32[0]  # type: ignore
-                    ",
-                );
-            }
-            if self.needs_f32_to_i32 {
-                self.src.push_str(
-                    "
-                        def _f32_to_i32(i: float) -> int:
-                            _i32_to_f32_f32[0] = i    # type: ignore
-                            return _i32_to_f32_i32[0] # type: ignore
-                    ",
-                );
-            }
-        }
-        if self.needs_i64_to_f64 || self.needs_f64_to_i64 {
-            self.pyimport("ctypes", None);
-            self.src
-                .push_str("_i64_to_f64_i64 = ctypes.pointer(ctypes.c_int64(0))\n");
-            self.src.push_str(
-                "_i64_to_f64_f64 = ctypes.cast(_i64_to_f64_i64, ctypes.POINTER(ctypes.c_double))\n",
-            );
-            if self.needs_i64_to_f64 {
-                self.src.push_str(
-                    "
-                        def _i64_to_f64(i: int) -> float:
-                            _i64_to_f64_i64[0] = i    # type: ignore
-                            return _i64_to_f64_f64[0] # type: ignore
-                    ",
-                );
-            }
-            if self.needs_f64_to_i64 {
-                self.src.push_str(
-                    "
-                        def _f64_to_i64(i: float) -> int:
-                            _i64_to_f64_f64[0] = i    # type: ignore
-                            return _i64_to_f64_i64[0] # type: ignore
-                    ",
-                );
-            }
-        }
-        if self.needs_decode_utf8 {
-            self.pyimport("ctypes", None);
-            self.src.push_str(
-                "
-                    def _decode_utf8(mem: wasmtime.Memory, store: wasmtime.Storelike, ptr: int, len: int) -> str:
-                        ptr = ptr & 0xffffffff
-                        len = len & 0xffffffff
-                        if ptr + len > mem.data_len(store):
-                            raise IndexError('string out of bounds')
-                        base = mem.data_ptr(store)
-                        base = ctypes.POINTER(ctypes.c_ubyte)(
-                            ctypes.c_ubyte.from_address(ctypes.addressof(base.contents) + ptr)
-                        )
-                        return ctypes.string_at(base, len).decode('utf-8')
-                ",
-            );
-        }
-        if self.needs_encode_utf8 {
-            self.pyimport("ctypes", None);
-            self.pyimport("typing", "Tuple");
-            self.src.push_str(
-                "
-                    def _encode_utf8(val: str, realloc: wasmtime.Func, mem: wasmtime.Memory, store: wasmtime.Storelike) -> Tuple[int, int]:
-                        bytes = val.encode('utf8')
-                        ptr = realloc(store, 0, 0, 1, len(bytes))
-                        assert(isinstance(ptr, int))
-                        ptr = ptr & 0xffffffff
-                        if ptr + len(bytes) > mem.data_len(store):
-                            raise IndexError('string out of bounds')
-                        base = mem.data_ptr(store)
-                        base = ctypes.POINTER(ctypes.c_ubyte)(
-                            ctypes.c_ubyte.from_address(ctypes.addressof(base.contents) + ptr)
-                        )
-                        ctypes.memmove(base, bytes, len(bytes))
-                        return (ptr, len(bytes))
-                ",
-            );
-        }
-        if self.needs_list_canon_lift {
-            self.pyimport("ctypes", None);
-            self.pyimport("typing", "List");
-            // TODO: this is doing a native-endian read, not a little-endian
-            // read
-            self.src.push_str(
-                "
-                    def _list_canon_lift(ptr: int, len: int, size: int, ty: Any, mem: wasmtime.Memory ,store: wasmtime.Storelike) -> Any:
-                        ptr = ptr & 0xffffffff
-                        len = len & 0xffffffff
-                        if ptr + len * size > mem.data_len(store):
-                            raise IndexError('list out of bounds')
-                        raw_base = mem.data_ptr(store)
-                        base = ctypes.POINTER(ty)(
-                            ty.from_address(ctypes.addressof(raw_base.contents) + ptr)
-                        )
-                        if ty == ctypes.c_uint8:
-                            return ctypes.string_at(base, len)
-                        return base[:len]
-                ",
-            );
-        }
-        if self.needs_list_canon_lower {
-            self.pyimport("ctypes", None);
-            self.pyimport("typing", "List");
-            self.pyimport("typing", "Tuple");
-            // TODO: is there a faster way to memcpy other than iterating over
-            // the input list?
-            // TODO: this is doing a native-endian write, not a little-endian
-            // write
-            self.src.push_str(
-                "
-                    def _list_canon_lower(list: Any, ty: Any, size: int, align: int, realloc: wasmtime.Func, mem: wasmtime.Memory, store: wasmtime.Storelike) -> Tuple[int, int]:
-                        total_size = size * len(list)
-                        ptr = realloc(store, 0, 0, align, total_size)
-                        assert(isinstance(ptr, int))
-                        ptr = ptr & 0xffffffff
-                        if ptr + total_size > mem.data_len(store):
-                            raise IndexError('list realloc return of bounds')
-                        raw_base = mem.data_ptr(store)
-                        base = ctypes.POINTER(ty)(
-                            ty.from_address(ctypes.addressof(raw_base.contents) + ptr)
-                        )
-                        for i, val in enumerate(list):
-                            base[i] = val
-                        return (ptr, len(list))
-                ",
-            );
-        }
-
+    /// Creates a `Source` with all of the required intrinsics
+    fn intrinsics(&mut self, iface: &Interface) -> Source {
         if iface.resources.len() > 0 {
-            self.pyimport("typing", "TypeVar");
-            self.pyimport("typing", "Generic");
-            self.pyimport("typing", "List");
-            self.pyimport("typing", "Optional");
-            self.pyimport("dataclasses", "dataclass");
-            self.needs_t_typevar = true;
-            self.src.push_str(
-                "
-                    @dataclass
-                    class SlabEntry(Generic[T]):
-                        next: int
-                        val: Optional[T]
-
-                    class Slab(Generic[T]):
-                        head: int
-                        list: List[SlabEntry[T]]
-
-                        def __init__(self) -> None:
-                            self.list = []
-                            self.head = 0
-
-                        def insert(self, val: T) -> int:
-                            if self.head >= len(self.list):
-                                self.list.append(SlabEntry(next = len(self.list) + 1, val = None))
-                            ret = self.head
-                            slot = self.list[ret]
-                            self.head = slot.next
-                            slot.next = -1
-                            slot.val = val
-                            return ret
-
-                        def get(self, idx: int) -> T:
-                            if idx >= len(self.list):
-                                raise IndexError('handle index not valid')
-                            slot = self.list[idx]
-                            if slot.next == -1:
-                                assert(slot.val is not None)
-                                return slot.val
-                            raise IndexError('handle index not valid')
-
-                        def remove(self, idx: int) -> T:
-                            ret = self.get(idx)
-                            slot = self.list[idx]
-                            slot.val = None
-                            slot.next = self.head
-                            self.head = idx
-                            return ret
-                ",
-            );
+            self.deps.needs_resources = true;
+            self.deps.pyimport("typing", "runtime_checkable");
         }
+        self.deps.intrinsics()
     }
+}
 
-    fn type_string(&mut self, iface: &Interface, ty: &Type) -> String {
-        let prev = mem::take(&mut self.src);
-        self.print_ty(iface, ty);
-        mem::replace(&mut self.src, prev).into()
-    }
-
-    fn print_ty(&mut self, iface: &Interface, ty: &Type) {
-        match ty {
-            Type::Unit => self.src.push_str("None"),
-            Type::Bool => self.src.push_str("bool"),
-            Type::U8
-            | Type::S8
-            | Type::U16
-            | Type::S16
-            | Type::U32
-            | Type::S32
-            | Type::U64
-            | Type::S64 => self.src.push_str("int"),
-            Type::Float32 | Type::Float64 => self.src.push_str("float"),
-            Type::Char => self.src.push_str("str"),
-            Type::String => self.src.push_str("str"),
-            Type::Handle(id) => {
-                // In general we want to use quotes around this to support
-                // forward-references (such as a method on a resource returning
-                // that resource), but that would otherwise generate type alias
-                // annotations that look like `Foo = 'HandleType'` which isn't
-                // creating a type alias but rather a string definition. Hack
-                // around that here to detect the type alias scenario and don't
-                // surround the type with quotes, otherwise surround with
-                // single-quotes.
-                let suffix = if self.src.ends_with(" = ") {
-                    ""
-                } else {
-                    self.src.push_str("'");
-                    "'"
-                };
-                self.src
-                    .push_str(&iface.resources[*id].name.to_camel_case());
-                self.src.push_str(suffix);
-            }
-            Type::Id(id) => {
-                let ty = &iface.types[*id];
-                if let Some(name) = &ty.name {
-                    self.src.push_str(&name.to_camel_case());
-                    return;
-                }
-                match &ty.kind {
-                    TypeDefKind::Type(t) => self.print_ty(iface, t),
-                    TypeDefKind::Tuple(t) => self.print_tuple(iface, t),
-                    TypeDefKind::Record(_)
-                    | TypeDefKind::Flags(_)
-                    | TypeDefKind::Enum(_)
-                    | TypeDefKind::Variant(_)
-                    | TypeDefKind::Union(_) => {
-                        unreachable!()
-                    }
-                    TypeDefKind::Option(t) => {
-                        self.pyimport("typing", "Optional");
-                        self.src.push_str("Optional[");
-                        self.print_ty(iface, t);
-                        self.src.push_str("]");
-                    }
-                    TypeDefKind::Expected(e) => {
-                        self.needs_expected = true;
-                        self.src.push_str("Expected[");
-                        self.print_ty(iface, &e.ok);
-                        self.src.push_str(", ");
-                        self.print_ty(iface, &e.err);
-                        self.src.push_str("]");
-                    }
-                    TypeDefKind::List(t) => self.print_list(iface, t),
-                }
-            }
-        }
-    }
-
-    fn print_tuple(&mut self, iface: &Interface, tuple: &Tuple) {
-        if tuple.types.is_empty() {
-            return self.src.push_str("None");
-        }
-        self.pyimport("typing", "Tuple");
-        self.src.push_str("Tuple[");
-        for (i, t) in tuple.types.iter().enumerate() {
-            if i > 0 {
-                self.src.push_str(", ");
-            }
-            self.print_ty(iface, t);
-        }
-        self.src.push_str("]");
-    }
-
-    fn print_list(&mut self, iface: &Interface, element: &Type) {
-        match element {
-            Type::U8 => self.src.push_str("bytes"),
-            t => {
-                self.pyimport("typing", "List");
-                self.src.push_str("List[");
-                self.print_ty(iface, t);
-                self.src.push_str("]");
-            }
-        }
-    }
-
-    fn pyimport<'a>(&mut self, module: &str, name: impl Into<Option<&'a str>>) {
-        let name = name.into();
-        let list = self
-            .pyimports
-            .entry(module.to_string())
-            .or_insert(match name {
-                Some(_) => Some(BTreeSet::new()),
-                None => None,
-            });
-        match name {
-            Some(name) => {
-                assert!(list.is_some());
-                list.as_mut().unwrap().insert(name.to_string());
-            }
-            None => assert!(list.is_none()),
-        }
-    }
-
-    fn array_ty(&self, iface: &Interface, ty: &Type) -> Option<&'static str> {
-        match ty {
-            Type::Unit | Type::Bool => None,
-            Type::U8 => Some("c_uint8"),
-            Type::S8 => Some("c_int8"),
-            Type::U16 => Some("c_uint16"),
-            Type::S16 => Some("c_int16"),
-            Type::U32 => Some("c_uint32"),
-            Type::S32 => Some("c_int32"),
-            Type::U64 => Some("c_uint64"),
-            Type::S64 => Some("c_int64"),
-            Type::Float32 => Some("c_float"),
-            Type::Float64 => Some("c_double"),
-            Type::Char => None,
-            Type::Handle(_) => None,
-            Type::String => None,
-            Type::Id(id) => match &iface.types[*id].kind {
-                TypeDefKind::Type(t) => self.array_ty(iface, t),
-                _ => None,
-            },
-        }
-    }
-
-    fn docs(&mut self, docs: &Docs) {
-        let docs = match &docs.contents {
-            Some(docs) => docs,
-            None => return,
-        };
-        for line in docs.lines() {
-            self.src.push_str(&format!("# {}\n", line));
-        }
-    }
-
-    fn print_sig(&mut self, iface: &Interface, func: &Function) -> Vec<String> {
-        if !self.in_import {
-            if let FunctionKind::Static { .. } = func.kind {
-                self.src.push_str("@classmethod\n");
-            }
-        }
-        self.src.push_str("def ");
-        match &func.kind {
-            FunctionKind::Method { .. } => self.src.push_str(&func.item_name().to_snake_case()),
-            FunctionKind::Static { .. } if !self.in_import => {
-                self.src.push_str(&func.item_name().to_snake_case())
-            }
-            _ => self.src.push_str(&func.name.to_snake_case()),
-        }
-        if self.in_import {
-            self.src.push_str("(self");
-        } else if let FunctionKind::Static { .. } = func.kind {
-            self.src.push_str("(cls, caller: wasmtime.Store, obj: '");
-            self.src.push_str(&iface.name.to_camel_case());
-            self.src.push_str("'");
-        } else {
-            self.src.push_str("(self, caller: wasmtime.Store");
-        }
-        let mut params = Vec::new();
-        for (i, (param, ty)) in func.params.iter().enumerate() {
-            if i == 0 {
-                if let FunctionKind::Method { .. } = func.kind {
-                    params.push("self".to_string());
-                    continue;
-                }
-            }
-            self.src.push_str(", ");
-            self.src.push_str(&param.to_snake_case());
-            params.push(param.to_snake_case());
-            self.src.push_str(": ");
-            self.print_ty(iface, ty);
-        }
-        self.src.push_str(") -> ");
-        self.print_ty(iface, &func.result);
-        params
+fn array_ty(iface: &Interface, ty: &Type) -> Option<&'static str> {
+    match ty {
+        Type::Unit | Type::Bool => None,
+        Type::U8 => Some("c_uint8"),
+        Type::S8 => Some("c_int8"),
+        Type::U16 => Some("c_uint16"),
+        Type::S16 => Some("c_int16"),
+        Type::U32 => Some("c_uint32"),
+        Type::S32 => Some("c_int32"),
+        Type::U64 => Some("c_uint64"),
+        Type::S64 => Some("c_int64"),
+        Type::Float32 => Some("c_float"),
+        Type::Float64 => Some("c_double"),
+        Type::Char => None,
+        Type::Handle(_) => None,
+        Type::String => None,
+        Type::Id(id) => match &iface.types[*id].kind {
+            TypeDefKind::Type(t) => array_ty(iface, t),
+            _ => None,
+        },
     }
 }
 
@@ -574,23 +137,24 @@ impl Generator for WasmtimePy {
         record: &Record,
         docs: &Docs,
     ) {
-        self.docs(docs);
-        self.pyimport("dataclasses", "dataclass");
-        self.src
-            .push_str(&format!("@dataclass\nclass {}:\n", name.to_camel_case()));
-        self.indent();
+        let mut builder = self.src.builder(&mut self.deps, iface);
+        builder.pyimport("dataclasses", "dataclass");
+        builder.push_str("@dataclass\n");
+        builder.push_str(&format!("class {}:\n", name.to_camel_case()));
+        builder.indent();
+        builder.docstring(docs);
         for field in record.fields.iter() {
-            self.docs(&field.docs);
-            self.src
-                .push_str(&format!("{}: ", field.name.to_snake_case()));
-            self.print_ty(iface, &field.ty);
-            self.src.push_str("\n");
+            builder.comment(&field.docs);
+            let field_name = field.name.to_snake_case();
+            builder.push_str(&format!("{field_name}: "));
+            builder.print_ty(&field.ty, true);
+            builder.push_str("\n");
         }
         if record.fields.is_empty() {
-            self.src.push_str("pass\n");
+            builder.push_str("pass\n");
         }
-        self.deindent();
-        self.src.push_str("\n");
+        builder.dedent();
+        builder.push_str("\n");
     }
 
     fn type_tuple(
@@ -601,36 +165,37 @@ impl Generator for WasmtimePy {
         tuple: &Tuple,
         docs: &Docs,
     ) {
-        self.docs(docs);
-        self.src.push_str(&format!("{} = ", name.to_camel_case()));
-        self.print_tuple(iface, tuple);
-        self.src.push_str("\n");
+        let mut builder = self.src.builder(&mut self.deps, iface);
+        builder.comment(docs);
+        builder.push_str(&format!("{} = ", name.to_camel_case()));
+        builder.print_tuple(tuple);
+        builder.push_str("\n");
     }
 
     fn type_flags(
         &mut self,
-        _iface: &Interface,
+        iface: &Interface,
         _id: TypeId,
         name: &str,
         flags: &Flags,
         docs: &Docs,
     ) {
-        self.docs(docs);
-        self.pyimport("enum", "Flag");
-        self.pyimport("enum", "auto");
-        self.src
-            .push_str(&format!("class {}(Flag):\n", name.to_camel_case()));
-        self.indent();
+        let mut builder = self.src.builder(&mut self.deps, iface);
+        builder.pyimport("enum", "Flag");
+        builder.pyimport("enum", "auto");
+        builder.push_str(&format!("class {}(Flag):\n", name.to_camel_case()));
+        builder.indent();
+        builder.docstring(docs);
         for flag in flags.flags.iter() {
-            self.docs(&flag.docs);
-            self.src
-                .push_str(&format!("{} = auto()\n", flag.name.to_shouty_snake_case()));
+            let flag_name = flag.name.to_shouty_snake_case();
+            builder.comment(&flag.docs);
+            builder.push_str(&format!("{flag_name} = auto()\n"));
         }
         if flags.flags.is_empty() {
-            self.src.push_str("pass\n");
+            builder.push_str("pass\n");
         }
-        self.deindent();
-        self.src.push_str("\n");
+        builder.dedent();
+        builder.push_str("\n");
     }
 
     fn type_variant(
@@ -641,32 +206,35 @@ impl Generator for WasmtimePy {
         variant: &Variant,
         docs: &Docs,
     ) {
-        self.docs(docs);
-        self.pyimport("dataclasses", "dataclass");
+        let mut builder = self.src.builder(&mut self.deps, iface);
+        builder.pyimport("dataclasses", "dataclass");
         let mut cases = Vec::new();
         for case in variant.cases.iter() {
-            self.docs(&case.docs);
-            self.src.push_str("@dataclass\n");
-            let name = format!("{}{}", name.to_camel_case(), case.name.to_camel_case());
-            self.src.push_str(&format!("class {}:\n", name));
-            self.indent();
-            self.src.push_str("value: ");
-            self.print_ty(iface, &case.ty);
-            self.src.push_str("\n");
-            self.deindent();
-            self.src.push_str("\n");
-            cases.push(name);
+            builder.docstring(&case.docs);
+            builder.push_str("@dataclass\n");
+            let case_name = format!("{}{}", name.to_camel_case(), case.name.to_camel_case());
+            builder.push_str(&format!("class {case_name}:\n"));
+            builder.indent();
+            builder.push_str("value: ");
+            builder.print_ty(&case.ty, true);
+            builder.push_str("\n");
+            builder.dedent();
+            builder.push_str("\n");
+            cases.push(case_name);
         }
 
-        self.pyimport("typing", "Union");
-        self.src.push_str(&format!(
+        builder.deps.pyimport("typing", "Union");
+        builder.comment(docs);
+        builder.push_str(&format!(
             "{} = Union[{}]\n",
             name.to_camel_case(),
             cases.join(", "),
         ));
-        self.src.push_str("\n");
+        builder.push_str("\n");
     }
 
+    /// Appends a Python definition for the provided Union to the current `Source`.
+    /// e.g. `MyUnion = Union[float, str, int]`
     fn type_union(
         &mut self,
         iface: &Interface,
@@ -675,28 +243,23 @@ impl Generator for WasmtimePy {
         union: &Union,
         docs: &Docs,
     ) {
-        self.docs(docs);
-        self.pyimport("dataclasses", "dataclass");
-        let mut cases = Vec::new();
-        let name = name.to_camel_case();
-        for (i, case) in union.cases.iter().enumerate() {
-            self.docs(&case.docs);
-            self.src.push_str("@dataclass\n");
-            let name = format!("{name}{i}");
-            self.src.push_str(&format!("class {name}:\n"));
-            self.indent();
-            self.src.push_str("value: ");
-            self.print_ty(iface, &case.ty);
-            self.src.push_str("\n");
-            self.deindent();
-            self.src.push_str("\n");
-            cases.push(name);
+        let mut py_type_classes = BTreeSet::new();
+        for case in union.cases.iter() {
+            py_type_classes.insert(py_type_class_of(&case.ty));
         }
 
-        self.pyimport("typing", "Union");
-        self.src
-            .push_str(&format!("{name} = Union[{}]\n", cases.join(", ")));
-        self.src.push_str("\n");
+        let mut builder = self.src.builder(&mut self.deps, iface);
+        if py_type_classes.len() != union.cases.len() {
+            // Some of the cases are not distinguishable
+            self.union_representation
+                .insert(name.to_string(), PyUnionRepresentation::Wrapped);
+            builder.print_union_wrapped(name, union, docs);
+        } else {
+            // All of the cases are distinguishable
+            self.union_representation
+                .insert(name.to_string(), PyUnionRepresentation::Raw);
+            builder.print_union_raw(name, union, docs);
+        }
     }
 
     fn type_option(
@@ -707,12 +270,13 @@ impl Generator for WasmtimePy {
         payload: &Type,
         docs: &Docs,
     ) {
-        self.docs(docs);
-        self.pyimport("typing", "Optional");
-        self.src
-            .push_str(&format!("{} = Optional[", name.to_camel_case()));
-        self.print_ty(iface, payload);
-        self.src.push_str("]\n\n");
+        let mut builder = self.src.builder(&mut self.deps, iface);
+        builder.pyimport("typing", "Optional");
+        builder.comment(docs);
+        builder.push_str(&name.to_camel_case());
+        builder.push_str(" = Optional[");
+        builder.print_ty(payload, true);
+        builder.push_str("]\n\n");
     }
 
     fn type_expected(
@@ -723,31 +287,25 @@ impl Generator for WasmtimePy {
         expected: &Expected,
         docs: &Docs,
     ) {
-        self.docs(docs);
-        self.needs_expected = true;
-        self.src
-            .push_str(&format!("{} = Expected[", name.to_camel_case()));
-        self.print_ty(iface, &expected.ok);
-        self.src.push_str(", ");
-        self.print_ty(iface, &expected.err);
-        self.src.push_str("]\n\n");
+        self.deps.needs_expected = true;
+
+        let mut builder = self.src.builder(&mut self.deps, iface);
+        builder.comment(docs);
+        builder.push_str(&format!("{} = Expected[", name.to_camel_case()));
+        builder.print_ty(&expected.ok, true);
+        builder.push_str(", ");
+        builder.print_ty(&expected.err, true);
+        builder.push_str("]\n\n");
     }
 
-    fn type_enum(
-        &mut self,
-        _iface: &Interface,
-        _id: TypeId,
-        name: &str,
-        enum_: &Enum,
-        docs: &Docs,
-    ) {
-        self.docs(docs);
-        self.pyimport("enum", "Enum");
-        self.src
-            .push_str(&format!("class {}(Enum):\n", name.to_camel_case()));
-        self.indent();
+    fn type_enum(&mut self, iface: &Interface, _id: TypeId, name: &str, enum_: &Enum, docs: &Docs) {
+        let mut builder = self.src.builder(&mut self.deps, iface);
+        builder.pyimport("enum", "Enum");
+        builder.push_str(&format!("class {}(Enum):\n", name.to_camel_case()));
+        builder.indent();
+        builder.docstring(docs);
         for (i, case) in enum_.cases.iter().enumerate() {
-            self.docs(&case.docs);
+            builder.comment(&case.docs);
 
             // TODO this handling of digits should be more general and
             // shouldn't be here just to fix the one case in wasi where an
@@ -758,10 +316,10 @@ impl Generator for WasmtimePy {
             if name.chars().next().unwrap().is_digit(10) {
                 name = format!("_{}", name);
             }
-            self.src.push_str(&format!("{} = {}\n", name, i));
+            builder.push_str(&format!("{} = {}\n", name, i));
         }
-        self.deindent();
-        self.src.push_str("\n");
+        builder.dedent();
+        builder.push_str("\n");
     }
 
     fn type_resource(&mut self, _iface: &Interface, _ty: ResourceId) {
@@ -771,17 +329,19 @@ impl Generator for WasmtimePy {
     }
 
     fn type_alias(&mut self, iface: &Interface, _id: TypeId, name: &str, ty: &Type, docs: &Docs) {
-        self.docs(docs);
-        self.src.push_str(&format!("{} = ", name.to_camel_case()));
-        self.print_ty(iface, ty);
-        self.src.push_str("\n");
+        let mut builder = self.src.builder(&mut self.deps, iface);
+        builder.comment(docs);
+        builder.push_str(&format!("{} = ", name.to_camel_case()));
+        builder.print_ty(ty, false);
+        builder.push_str("\n");
     }
 
     fn type_list(&mut self, iface: &Interface, _id: TypeId, name: &str, ty: &Type, docs: &Docs) {
-        self.docs(docs);
-        self.src.push_str(&format!("{} = ", name.to_camel_case()));
-        self.print_list(iface, ty);
-        self.src.push_str("\n");
+        let mut builder = self.src.builder(&mut self.deps, iface);
+        builder.comment(docs);
+        builder.push_str(&format!("{} = ", name.to_camel_case()));
+        builder.print_list(ty);
+        builder.push_str("\n");
     }
 
     fn type_builtin(&mut self, iface: &Interface, id: TypeId, name: &str, ty: &Type, docs: &Docs) {
@@ -793,33 +353,37 @@ impl Generator for WasmtimePy {
     // this `Generator` implementation.
     fn export(&mut self, iface: &Interface, func: &Function) {
         assert!(!func.is_async, "async not supported yet");
-        let prev = mem::take(&mut self.src);
+        let mut pysig = Source::default();
+        let mut builder = pysig.builder(&mut self.deps, iface);
+        builder.print_sig(func, self.in_import);
+        let pysig = pysig.to_string();
 
-        self.print_sig(iface, func);
-        let pysig = mem::take(&mut self.src).into();
+        let mut func_body = Source::default();
+        let mut builder = func_body.builder(&mut self.deps, iface);
 
         let sig = iface.wasm_signature(AbiVariant::GuestImport, func);
-        self.src.push_str(&format!(
+        builder.push_str(&format!(
             "def {}(caller: wasmtime.Caller",
             func.name.to_snake_case(),
         ));
         let mut params = Vec::new();
         for (i, param) in sig.params.iter().enumerate() {
-            self.src.push_str(", ");
+            builder.push_str(", ");
             let name = format!("arg{}", i);
-            self.src.push_str(&name);
-            self.src.push_str(": ");
-            self.src.push_str(wasm_ty_typing(*param));
+            builder.push_str(&name);
+            builder.push_str(": ");
+            builder.push_str(wasm_ty_typing(*param));
             params.push(name);
         }
-        self.src.push_str(") -> ");
+        builder.push_str(") -> ");
         match sig.results.len() {
-            0 => self.src.push_str("None"),
-            1 => self.src.push_str(wasm_ty_typing(sig.results[0])),
+            0 => builder.push_str("None"),
+            1 => builder.push_str(wasm_ty_typing(sig.results[0])),
             _ => unimplemented!(),
         }
-        self.src.push_str(":\n");
-        self.indent();
+        builder.push_str(":\n");
+        builder.indent();
+        drop(builder);
 
         let mut f = FunctionBindgen::new(self, params);
         iface.call(
@@ -838,34 +402,30 @@ impl Generator for WasmtimePy {
             ..
         } = f;
 
+        let mut builder = func_body.builder(&mut self.deps, iface);
         if needs_memory {
             // TODO: hardcoding "memory"
-            self.src.push_str("m = caller[\"memory\"]\n");
-            self.src
-                .push_str("assert(isinstance(m, wasmtime.Memory))\n");
-            self.pyimport("typing", "cast");
-            self.src.push_str("memory = cast(wasmtime.Memory, m)\n");
+            builder.push_str("m = caller[\"memory\"]\n");
+            builder.push_str("assert(isinstance(m, wasmtime.Memory))\n");
+            builder.deps.pyimport("typing", "cast");
+            builder.push_str("memory = cast(wasmtime.Memory, m)\n");
             locals.insert("memory").unwrap();
         }
 
         if let Some(name) = needs_realloc {
-            self.src
-                .push_str(&format!("realloc = caller[\"{}\"]\n", name));
-            self.src
-                .push_str("assert(isinstance(realloc, wasmtime.Func))\n");
+            builder.push_str(&format!("realloc = caller[\"{}\"]\n", name));
+            builder.push_str("assert(isinstance(realloc, wasmtime.Func))\n");
             locals.insert("realloc").unwrap();
         }
 
         if let Some(name) = needs_free {
-            self.src.push_str(&format!("free = caller[\"{}\"]\n", name));
-            self.src
-                .push_str("assert(isinstance(free, wasmtime.Func))\n");
+            builder.push_str(&format!("free = caller[\"{}\"]\n", name));
+            builder.push_str("assert(isinstance(free, wasmtime.Func))\n");
             locals.insert("free").unwrap();
         }
-        self.src.push_str(&src);
-        self.deindent();
+        builder.push_str(&src);
+        builder.dedent();
 
-        let src = mem::replace(&mut self.src, prev);
         let mut wasm_ty = String::from("wasmtime.FuncType([");
         wasm_ty.push_str(
             &sig.params
@@ -885,7 +445,7 @@ impl Generator for WasmtimePy {
         wasm_ty.push_str("])");
         let import = Import {
             name: func.name.clone(),
-            src,
+            src: func_body,
             wasm_ty,
             pysig,
         };
@@ -910,12 +470,16 @@ impl Generator for WasmtimePy {
     // this `Generator` implementation.
     fn import(&mut self, iface: &Interface, func: &Function) {
         assert!(!func.is_async, "async not supported yet");
-        let prev = mem::take(&mut self.src);
+        let mut func_body = Source::default();
+        let mut builder = func_body.builder(&mut self.deps, iface);
 
-        let params = self.print_sig(iface, func);
-        self.src.push_str(":\n");
-        self.indent();
+        // Print the function signature
+        let params = builder.print_sig(func, self.in_import);
+        builder.push_str(":\n");
+        builder.indent();
+        drop(builder);
 
+        // Use FunctionBindgen call
         let src_object = match &func.kind {
             FunctionKind::Freestanding => "self".to_string(),
             FunctionKind::Static { .. } => "obj".to_string(),
@@ -929,7 +493,6 @@ impl Generator for WasmtimePy {
             func,
             &mut f,
         );
-
         let FunctionBindgen {
             src,
             needs_memory,
@@ -938,14 +501,14 @@ impl Generator for WasmtimePy {
             src_object,
             ..
         } = f;
+        let mut builder = func_body.builder(&mut self.deps, iface);
         if needs_memory {
             // TODO: hardcoding "memory"
-            self.src
-                .push_str(&format!("memory = {}._memory;\n", src_object));
+            builder.push_str(&format!("memory = {}._memory;\n", src_object));
         }
 
         if let Some(name) = &needs_realloc {
-            self.src.push_str(&format!(
+            builder.push_str(&format!(
                 "realloc = {}._{}\n",
                 src_object,
                 name.to_snake_case(),
@@ -953,14 +516,14 @@ impl Generator for WasmtimePy {
         }
 
         if let Some(name) = &needs_free {
-            self.src.push_str(&format!(
+            builder.push_str(&format!(
                 "free = {}._{}\n",
                 src_object,
                 name.to_snake_case(),
             ));
         }
-        self.src.push_str(&src);
-        self.deindent();
+        builder.push_str(&src);
+        builder.dedent();
 
         let exports = self
             .guest_exports
@@ -979,7 +542,6 @@ impl Generator for WasmtimePy {
         }
         exports.fields.insert(func.name.clone(), "wasmtime.Func");
 
-        let func_body = mem::replace(&mut self.src, prev);
         let dst = match &func.kind {
             FunctionKind::Freestanding => &mut exports.freestanding_funcs,
             FunctionKind::Static { resource, .. } | FunctionKind::Method { resource, .. } => {
@@ -993,14 +555,13 @@ impl Generator for WasmtimePy {
     }
 
     fn finish_one(&mut self, iface: &Interface, files: &mut Files) {
-        self.pyimport("typing", "Any");
-        self.pyimport("abc", "abstractmethod");
+        self.deps.pyimport("typing", "Any");
+        self.deps.pyimport("abc", "abstractmethod");
 
         let types = mem::take(&mut self.src);
-        self.print_intrinsics(iface);
-        let intrinsics = mem::take(&mut self.src);
+        let intrinsics = self.intrinsics(iface);
 
-        for (k, v) in self.pyimports.iter() {
+        for (k, v) in self.deps.pyimports.iter() {
             match v {
                 Some(list) => {
                     let list = list.iter().cloned().collect::<Vec<_>>().join(", ");
@@ -1023,7 +584,7 @@ impl Generator for WasmtimePy {
         );
         self.src.push_str("\n");
 
-        if self.needs_t_typevar {
+        if self.deps.needs_t_typevar {
             self.src.push_str("T = TypeVar('T')\n");
         }
 
@@ -1031,12 +592,13 @@ impl Generator for WasmtimePy {
         for (id, r) in iface.resources.iter() {
             let name = r.name.to_camel_case();
             if self.in_import {
+                self.src.push_str("@runtime_checkable\n");
                 self.src.push_str(&format!("class {}(Protocol):\n", name));
-                self.src.indent(2);
+                self.src.indent();
                 self.src.push_str("def drop(self) -> None:\n");
-                self.src.indent(2);
+                self.src.indent();
                 self.src.push_str("pass\n");
-                self.src.deindent(2);
+                self.src.dedent();
 
                 for (_, funcs) in self.guest_imports.iter() {
                     if let Some(funcs) = funcs.resource_funcs.get(&id) {
@@ -1044,16 +606,16 @@ impl Generator for WasmtimePy {
                             self.src.push_str("@abstractmethod\n");
                             self.src.push_str(&func.pysig);
                             self.src.push_str(":\n");
-                            self.src.indent(2);
+                            self.src.indent();
                             self.src.push_str("raise NotImplementedError\n");
-                            self.src.deindent(2);
+                            self.src.dedent();
                         }
                     }
                 }
-                self.src.deindent(2);
+                self.src.dedent();
             } else {
                 self.src.push_str(&format!("class {}:\n", name));
-                self.src.indent(2);
+                self.src.indent();
                 self.src.push_str(&format!(
                     "
                         _wasm_val: int
@@ -1096,7 +658,7 @@ impl Generator for WasmtimePy {
                     }
                 }
 
-                self.src.deindent(2);
+                self.src.dedent();
             }
         }
         self.src.push_str(&types);
@@ -1104,16 +666,16 @@ impl Generator for WasmtimePy {
         for (module, funcs) in mem::take(&mut self.guest_imports) {
             self.src
                 .push_str(&format!("class {}(Protocol):\n", module.to_camel_case()));
-            self.indent();
+            self.src.indent();
             for func in funcs.freestanding_funcs.iter() {
                 self.src.push_str("@abstractmethod\n");
                 self.src.push_str(&func.pysig);
                 self.src.push_str(":\n");
-                self.indent();
+                self.src.indent();
                 self.src.push_str("raise NotImplementedError\n");
-                self.deindent();
+                self.src.dedent();
             }
-            self.deindent();
+            self.src.dedent();
             self.src.push_str("\n");
 
             self.src.push_str(&format!(
@@ -1121,7 +683,7 @@ impl Generator for WasmtimePy {
                 module.to_snake_case(),
                 module.to_camel_case(),
             ));
-            self.indent();
+            self.src.indent();
 
             for (id, r) in iface.resources.iter() {
                 self.src.push_str(&format!(
@@ -1165,7 +727,7 @@ impl Generator for WasmtimePy {
                     resource.name, snake,
                 ));
             }
-            self.deindent();
+            self.src.dedent();
         }
 
         // This is exculsively here to get mypy to not complain about empty
@@ -1173,7 +735,7 @@ impl Generator for WasmtimePy {
         if !self.in_import && self.guest_exports.is_empty() {
             self.src
                 .push_str(&format!("class {}:\n", iface.name.to_camel_case()));
-            self.indent();
+            self.src.indent();
             if iface.resources.len() == 0 {
                 self.src.push_str("pass\n");
             } else {
@@ -1184,13 +746,13 @@ impl Generator for WasmtimePy {
                     ));
                 }
             }
-            self.deindent();
+            self.src.dedent();
         }
 
         for (module, exports) in mem::take(&mut self.guest_exports) {
             let module = module.to_camel_case();
             self.src.push_str(&format!("class {}:\n", module));
-            self.indent();
+            self.src.indent();
 
             self.src.push_str("instance: wasmtime.Instance\n");
             for (name, ty) in exports.fields.iter() {
@@ -1210,7 +772,7 @@ impl Generator for WasmtimePy {
             }
 
             self.src.push_str("def __init__(self, store: wasmtime.Store, linker: wasmtime.Linker, module: wasmtime.Module):\n");
-            self.indent();
+            self.src.indent();
             for (id, r) in iface.resources.iter() {
                 self.src.push_str(&format!(
                     "
@@ -1269,13 +831,13 @@ impl Generator for WasmtimePy {
                     snake = r.name.to_snake_case(),
                 ));
             }
-            self.deindent();
+            self.src.dedent();
 
             for func in exports.freestanding_funcs.iter() {
                 self.src.push_str(&func);
             }
 
-            self.deindent();
+            self.src.dedent();
         }
 
         files.push("bindings.py", self.src.as_bytes());
@@ -1324,13 +886,13 @@ impl FunctionBindgen<'_> {
     where
         T: std::fmt::Display,
     {
-        self.gen.needs_clamp = true;
+        self.gen.deps.needs_clamp = true;
         results.push(format!("_clamp({}, {}, {})", operands[0], min, max));
     }
 
     fn load(&mut self, ty: &str, offset: i32, operands: &[String], results: &mut Vec<String>) {
         self.needs_memory = true;
-        self.gen.needs_load = true;
+        self.gen.deps.needs_load = true;
         let tmp = self.locals.tmp("load");
         self.src.push_str(&format!(
             "{} = _load(ctypes.{}, memory, caller, {}, {})\n",
@@ -1341,7 +903,7 @@ impl FunctionBindgen<'_> {
 
     fn store(&mut self, ty: &str, offset: i32, operands: &[String]) {
         self.needs_memory = true;
-        self.gen.needs_store = true;
+        self.gen.deps.needs_store = true;
         self.src.push_str(&format!(
             "_store(ctypes.{}, memory, caller, {}, {}, {})\n",
             ty, operands[1], offset, operands[0]
@@ -1367,12 +929,12 @@ impl Bindgen for FunctionBindgen<'_> {
         self.blocks.push((src.into(), mem::take(operands)));
     }
 
-    fn return_pointer(&mut self, _size: usize, _align: usize) -> String {
+    fn return_pointer(&mut self, _iface: &Interface, _size: usize, _align: usize) -> String {
         unimplemented!()
     }
 
     fn is_list_canonical(&self, iface: &Interface, ty: &Type) -> bool {
-        self.gen.array_ty(iface, ty).is_some()
+        array_ty(iface, ty).is_some()
     }
 
     fn emit(
@@ -1382,6 +944,7 @@ impl Bindgen for FunctionBindgen<'_> {
         operands: &mut Vec<String>,
         results: &mut Vec<String>,
     ) {
+        let mut builder = self.src.builder(&mut self.gen.deps, iface);
         match inst {
             Instruction::GetArg { nth } => results.push(self.params[*nth].clone()),
             Instruction::I32Const { val } => results.push(val.to_string()),
@@ -1442,7 +1005,7 @@ impl Bindgen for FunctionBindgen<'_> {
             // Validate that i32 values coming from wasm are indeed valid code
             // points.
             Instruction::CharFromI32 => {
-                self.gen.needs_validate_guest_char = true;
+                builder.deps.needs_validate_guest_char = true;
                 results.push(format!("_validate_guest_char({})", operands[0]));
             }
 
@@ -1454,27 +1017,27 @@ impl Bindgen for FunctionBindgen<'_> {
                 for (cast, op) in casts.iter().zip(operands) {
                     match cast {
                         Bitcast::I32ToF32 => {
-                            self.gen.needs_i32_to_f32 = true;
+                            builder.deps.needs_i32_to_f32 = true;
                             results.push(format!("_i32_to_f32({})", op));
                         }
                         Bitcast::F32ToI32 => {
-                            self.gen.needs_f32_to_i32 = true;
+                            builder.deps.needs_f32_to_i32 = true;
                             results.push(format!("_f32_to_i32({})", op));
                         }
                         Bitcast::I64ToF64 => {
-                            self.gen.needs_i64_to_f64 = true;
+                            builder.deps.needs_i64_to_f64 = true;
                             results.push(format!("_i64_to_f64({})", op));
                         }
                         Bitcast::F64ToI64 => {
-                            self.gen.needs_f64_to_i64 = true;
+                            builder.deps.needs_f64_to_i64 = true;
                             results.push(format!("_f64_to_i64({})", op));
                         }
                         Bitcast::I64ToF32 => {
-                            self.gen.needs_i32_to_f32 = true;
+                            builder.deps.needs_i32_to_f32 = true;
                             results.push(format!("_i32_to_f32(({}) & 0xffffffff)", op));
                         }
                         Bitcast::F32ToI64 => {
-                            self.gen.needs_f32_to_i32 = true;
+                            builder.deps.needs_f32_to_i32 = true;
                             results.push(format!("_f32_to_i32({})", op));
                         }
                         Bitcast::I32ToI64 | Bitcast::I64ToI32 | Bitcast::None => {
@@ -1491,7 +1054,7 @@ impl Bindgen for FunctionBindgen<'_> {
             Instruction::BoolFromI32 => {
                 let op = self.locals.tmp("operand");
                 let ret = self.locals.tmp("boolean");
-                self.src.push_str(&format!(
+                builder.push_str(&format!(
                     "
                         {op} = {}
                         if {op} == 0:
@@ -1524,7 +1087,7 @@ impl Bindgen for FunctionBindgen<'_> {
             // in Python.
             Instruction::I32FromBorrowedHandle { ty } => {
                 let obj = self.locals.tmp("obj");
-                self.src.push_str(&format!("{} = {}\n", obj, operands[0]));
+                builder.push_str(&format!("{} = {}\n", obj, operands[0]));
 
                 results.push(format!(
                     "{}._resource{}_slab.insert({}.clone())",
@@ -1546,10 +1109,10 @@ impl Bindgen for FunctionBindgen<'_> {
                     return;
                 }
                 let tmp = self.locals.tmp("record");
-                self.src.push_str(&format!("{} = {}\n", tmp, operands[0]));
+                builder.push_str(&format!("{} = {}\n", tmp, operands[0]));
                 for field in record.fields.iter() {
                     let name = self.locals.tmp("field");
-                    self.src.push_str(&format!(
+                    builder.push_str(&format!(
                         "{} = {}.{}\n",
                         name,
                         tmp,
@@ -1566,16 +1129,16 @@ impl Bindgen for FunctionBindgen<'_> {
                 if tuple.types.is_empty() {
                     return;
                 }
-                self.src.push_str("(");
+                builder.push_str("(");
                 for _ in 0..tuple.types.len() {
                     let name = self.locals.tmp("tuplei");
-                    self.src.push_str(&name);
-                    self.src.push_str(",");
+                    builder.push_str(&name);
+                    builder.push_str(",");
                     results.push(name);
                 }
-                self.src.push_str(") = ");
-                self.src.push_str(&operands[0]);
-                self.src.push_str("\n");
+                builder.push_str(") = ");
+                builder.push_str(&operands[0]);
+                builder.push_str("\n");
             }
             Instruction::TupleLift { .. } => {
                 if operands.is_empty() {
@@ -1589,10 +1152,10 @@ impl Bindgen for FunctionBindgen<'_> {
                     1 => operands[0].clone(),
                     _ => {
                         let tmp = self.locals.tmp("flags");
-                        self.src.push_str(&format!("{tmp} = 0\n"));
+                        builder.push_str(&format!("{tmp} = 0\n"));
                         for (i, op) in operands.iter().enumerate() {
                             let i = 32 * i;
-                            self.src.push_str(&format!("{tmp} |= {op} << {i}\n"));
+                            builder.push_str(&format!("{tmp} |= {op} << {i}\n"));
                         }
                         tmp
                     }
@@ -1641,35 +1204,34 @@ impl Bindgen for FunctionBindgen<'_> {
                     variant.cases.iter().zip(blocks).zip(payloads).enumerate()
                 {
                     if i == 0 {
-                        self.src.push_str("if ");
+                        builder.push_str("if ");
                     } else {
-                        self.src.push_str("elif ");
+                        builder.push_str("elif ");
                     }
 
-                    self.src.push_str(&format!(
+                    builder.push_str(&format!(
                         "isinstance({}, {}{}):\n",
                         operands[0],
                         name.to_camel_case(),
                         case.name.to_camel_case()
                     ));
-                    self.src.indent(2);
-                    self.src
-                        .push_str(&format!("{} = {}.value\n", payload, operands[0]));
-                    self.src.push_str(&block);
+                    builder.indent();
+                    builder.push_str(&format!("{} = {}.value\n", payload, operands[0]));
+                    builder.push_str(&block);
 
                     for (i, result) in block_results.iter().enumerate() {
-                        self.src.push_str(&format!("{} = {}\n", results[i], result));
+                        builder.push_str(&format!("{} = {}\n", results[i], result));
                     }
-                    self.src.deindent(2);
+                    builder.dedent();
                 }
                 let variant_name = name.to_camel_case();
-                self.src.push_str("else:\n");
-                self.src.indent(2);
-                self.src.push_str(&format!(
+                builder.push_str("else:\n");
+                builder.indent();
+                builder.push_str(&format!(
                     "raise TypeError(\"invalid variant specified for {}\")\n",
                     variant_name
                 ));
-                self.src.deindent(2);
+                builder.dedent();
             }
 
             Instruction::VariantLift {
@@ -1681,42 +1243,38 @@ impl Bindgen for FunctionBindgen<'_> {
                     .collect::<Vec<_>>();
 
                 let result = self.locals.tmp("variant");
-                self.src.push_str(&format!(
-                    "{}: {}\n",
-                    result,
-                    self.gen.type_string(iface, &Type::Id(*ty)),
-                ));
+                builder.print_var_declaration(&result, &Type::Id(*ty));
                 for (i, (case, (block, block_results))) in
                     variant.cases.iter().zip(blocks).enumerate()
                 {
                     if i == 0 {
-                        self.src.push_str("if ");
+                        builder.push_str("if ");
                     } else {
-                        self.src.push_str("elif ");
+                        builder.push_str("elif ");
                     }
-                    self.src.push_str(&format!("{} == {}:\n", operands[0], i));
-                    self.src.indent(2);
-                    self.src.push_str(&block);
+                    builder.push_str(&format!("{} == {}:\n", operands[0], i));
+                    builder.indent();
+                    builder.push_str(&block);
 
-                    self.src.push_str(&format!(
+                    builder.push_str(&format!(
                         "{} = {}{}(",
                         result,
                         name.to_camel_case(),
                         case.name.to_camel_case()
                     ));
                     assert!(block_results.len() == 1);
-                    self.src.push_str(&block_results[0]);
-                    self.src.push_str(")\n");
-                    self.src.deindent(2);
+                    builder.push_str(&block_results[0]);
+                    builder.push_str(")\n");
+                    builder.dedent();
                 }
-                self.src.push_str("else:\n");
-                self.src.indent(2);
+                builder.push_str("else:\n");
+                builder.indent();
                 let variant_name = name.to_camel_case();
-                self.src.push_str(&format!(
+                builder.push_str(&format!(
                     "raise TypeError(\"invalid variant discriminant for {}\")\n",
                     variant_name
                 ));
-                self.src.deindent(2);
+                builder.dedent();
                 results.push(result);
             }
 
@@ -1739,28 +1297,53 @@ impl Bindgen for FunctionBindgen<'_> {
                     results.push(self.locals.tmp("variant"));
                 }
 
+                // Assumes that type_union has been called for this union
+                let union_representation = *self
+                    .gen
+                    .union_representation
+                    .get(&name.to_string())
+                    .unwrap();
                 let name = name.to_camel_case();
                 let op0 = &operands[0];
-                for (i, ((_case, (block, block_results)), payload)) in
+                for (i, ((case, (block, block_results)), payload)) in
                     union.cases.iter().zip(blocks).zip(payloads).enumerate()
                 {
-                    self.src.push_str(if i == 0 { "if " } else { "elif " });
-                    self.src
-                        .push_str(&format!("isinstance({op0}, {name}{i}):\n"));
-                    self.src.indent(2);
-                    self.src.push_str(&format!("{payload} = {op0}.value\n"));
-                    self.src.push_str(&block);
-                    for (i, result) in block_results.iter().enumerate() {
-                        self.src.push_str(&format!("{} = {result}\n", results[i]));
+                    builder.push_str(if i == 0 { "if " } else { "elif " });
+                    builder.push_str(&format!("isinstance({op0}, "));
+                    match union_representation {
+                        // Prints the Python type for this union case
+                        PyUnionRepresentation::Raw => {
+                            builder.print_ty(&case.ty, false);
+                        }
+                        // Prints the name of this union cases dataclass
+                        PyUnionRepresentation::Wrapped => {
+                            builder.push_str(&format!("{name}{i}"));
+                        }
                     }
-                    self.src.deindent(2);
+                    builder.push_str(&format!("):\n"));
+                    builder.indent();
+                    match union_representation {
+                        // Uses the value directly
+                        PyUnionRepresentation::Raw => {
+                            builder.push_str(&format!("{payload} = {op0}\n"))
+                        }
+                        // Uses this union case dataclass's inner value
+                        PyUnionRepresentation::Wrapped => {
+                            builder.push_str(&format!("{payload} = {op0}.value\n"))
+                        }
+                    }
+                    builder.push_str(&block);
+                    for (i, result) in block_results.iter().enumerate() {
+                        builder.push_str(&format!("{} = {result}\n", results[i]));
+                    }
+                    builder.dedent();
                 }
-                self.src.push_str("else:\n");
-                self.src.indent(2);
-                self.src.push_str(&format!(
+                builder.push_str("else:\n");
+                builder.indent();
+                builder.push_str(&format!(
                     "raise TypeError(\"invalid variant specified for {name}\")\n"
                 ));
-                self.src.deindent(2);
+                builder.dedent();
             }
 
             Instruction::UnionLift {
@@ -1772,31 +1355,42 @@ impl Bindgen for FunctionBindgen<'_> {
                     .collect::<Vec<_>>();
 
                 let result = self.locals.tmp("variant");
-                self.src.push_str(&format!(
-                    "{result}: {}\n",
-                    self.gen.type_string(iface, &Type::Id(*ty)),
-                ));
+                builder.print_var_declaration(&result, &Type::Id(*ty));
+                // Assumes that type_union has been called for this union
+                let union_representation = *self
+                    .gen
+                    .union_representation
+                    .get(&name.to_string())
+                    .unwrap();
                 let name = name.to_camel_case();
                 let op0 = &operands[0];
                 for (i, (_case, (block, block_results))) in
                     union.cases.iter().zip(blocks).enumerate()
                 {
-                    self.src.push_str(if i == 0 { "if " } else { "elif " });
-                    self.src.push_str(&format!("{op0} == {i}:\n"));
-                    self.src.indent(2);
-                    self.src.push_str(&block);
+                    builder.push_str(if i == 0 { "if " } else { "elif " });
+                    builder.push_str(&format!("{op0} == {i}:\n"));
+                    builder.indent();
+                    builder.push_str(&block);
                     assert!(block_results.len() == 1);
                     let block_result = &block_results[0];
-                    self.src
-                        .push_str(&format!("{result} = {name}{i}({block_result})\n"));
-                    self.src.deindent(2);
+                    builder.push_str(&format!("{result} = "));
+                    match union_representation {
+                        // Uses the passed value directly
+                        PyUnionRepresentation::Raw => builder.push_str(block_result),
+                        // Constructs an instance of the union cases dataclass
+                        PyUnionRepresentation::Wrapped => {
+                            builder.push_str(&format!("{name}{i}({block_result})"))
+                        }
+                    }
+                    builder.newline();
+                    builder.dedent();
                 }
-                self.src.push_str("else:\n");
-                self.src.indent(2);
-                self.src.push_str(&format!(
+                builder.push_str("else:\n");
+                builder.indent();
+                builder.push_str(&format!(
                     "raise TypeError(\"invalid variant discriminant for {name}\")\n",
                 ));
-                self.src.deindent(2);
+                builder.dedent();
                 results.push(result);
             }
 
@@ -1814,22 +1408,22 @@ impl Bindgen for FunctionBindgen<'_> {
                 }
 
                 let op0 = &operands[0];
-                self.src.push_str(&format!("if {op0} is None:\n"));
+                builder.push_str(&format!("if {op0} is None:\n"));
 
-                self.src.indent(2);
-                self.src.push_str(&none);
+                builder.indent();
+                builder.push_str(&none);
                 for (dst, result) in results.iter().zip(&none_results) {
-                    self.src.push_str(&format!("{dst} = {result}\n"));
+                    builder.push_str(&format!("{dst} = {result}\n"));
                 }
-                self.src.deindent(2);
-                self.src.push_str("else:\n");
-                self.src.indent(2);
-                self.src.push_str(&format!("{some_payload} = {op0}\n"));
-                self.src.push_str(&some);
+                builder.dedent();
+                builder.push_str("else:\n");
+                builder.indent();
+                builder.push_str(&format!("{some_payload} = {op0}\n"));
+                builder.push_str(&some);
                 for (dst, result) in results.iter().zip(&some_results) {
-                    self.src.push_str(&format!("{dst} = {result}\n"));
+                    builder.push_str(&format!("{dst} = {result}\n"));
                 }
-                self.src.deindent(2);
+                builder.dedent();
             }
 
             Instruction::OptionLift { ty, .. } => {
@@ -1841,28 +1435,24 @@ impl Bindgen for FunctionBindgen<'_> {
                 assert_eq!(none_results[0], "None");
 
                 let result = self.locals.tmp("option");
-                self.src.push_str(&format!(
-                    "{result}: {}\n",
-                    self.gen.type_string(iface, &Type::Id(*ty)),
-                ));
+                builder.print_var_declaration(&result, &Type::Id(*ty));
 
                 let op0 = &operands[0];
-                self.src.push_str(&format!("if {op0} == 0:\n"));
-                self.src.indent(2);
-                self.src.push_str(&none);
-                self.src.push_str(&format!("{result} = None\n"));
-                self.src.deindent(2);
-                self.src.push_str(&format!("elif {op0} == 1:\n"));
-                self.src.indent(2);
-                self.src.push_str(&some);
-                self.src.push_str(&format!("{result} = {some_result}\n"));
-                self.src.deindent(2);
+                builder.push_str(&format!("if {op0} == 0:\n"));
+                builder.indent();
+                builder.push_str(&none);
+                builder.push_str(&format!("{result} = None\n"));
+                builder.dedent();
+                builder.push_str(&format!("elif {op0} == 1:\n"));
+                builder.indent();
+                builder.push_str(&some);
+                builder.push_str(&format!("{result} = {some_result}\n"));
+                builder.dedent();
 
-                self.src.push_str("else:\n");
-                self.src.indent(2);
-                self.src
-                    .push_str("raise TypeError(\"invalid variant discriminant for option\")\n");
-                self.src.deindent(2);
+                builder.push_str("else:\n");
+                builder.indent();
+                builder.push_str("raise TypeError(\"invalid variant discriminant for option\")\n");
+                builder.dedent();
 
                 results.push(result);
             }
@@ -1881,30 +1471,29 @@ impl Bindgen for FunctionBindgen<'_> {
                 }
 
                 let op0 = &operands[0];
-                self.src.push_str(&format!("if isinstance({op0}, Ok):\n"));
+                builder.push_str(&format!("if isinstance({op0}, Ok):\n"));
 
-                self.src.indent(2);
-                self.src.push_str(&format!("{ok_payload} = {op0}.value\n"));
-                self.src.push_str(&ok);
+                builder.indent();
+                builder.push_str(&format!("{ok_payload} = {op0}.value\n"));
+                builder.push_str(&ok);
                 for (dst, result) in results.iter().zip(&ok_results) {
-                    self.src.push_str(&format!("{dst} = {result}\n"));
+                    builder.push_str(&format!("{dst} = {result}\n"));
                 }
-                self.src.deindent(2);
-                self.src
-                    .push_str(&format!("elif isinstance({op0}, Err):\n"));
-                self.src.indent(2);
-                self.src.push_str(&format!("{err_payload} = {op0}.value\n"));
-                self.src.push_str(&err);
+                builder.dedent();
+                builder.push_str(&format!("elif isinstance({op0}, Err):\n"));
+                builder.indent();
+                builder.push_str(&format!("{err_payload} = {op0}.value\n"));
+                builder.push_str(&err);
                 for (dst, result) in results.iter().zip(&err_results) {
-                    self.src.push_str(&format!("{dst} = {result}\n"));
+                    builder.push_str(&format!("{dst} = {result}\n"));
                 }
-                self.src.deindent(2);
-                self.src.push_str("else:\n");
-                self.src.indent(2);
-                self.src.push_str(&format!(
+                builder.dedent();
+                builder.push_str("else:\n");
+                builder.indent();
+                builder.push_str(&format!(
                     "raise TypeError(\"invalid variant specified for expected\")\n",
                 ));
-                self.src.deindent(2);
+                builder.dedent();
             }
 
             Instruction::ExpectedLift { ty, .. } => {
@@ -1916,29 +1505,25 @@ impl Bindgen for FunctionBindgen<'_> {
                 let ok_result = &ok_results[0];
 
                 let result = self.locals.tmp("expected");
-                self.src.push_str(&format!(
-                    "{result}: {}\n",
-                    self.gen.type_string(iface, &Type::Id(*ty)),
-                ));
+                builder.print_var_declaration(&result, &Type::Id(*ty));
 
                 let op0 = &operands[0];
-                self.src.push_str(&format!("if {op0} == 0:\n"));
-                self.src.indent(2);
-                self.src.push_str(&ok);
-                self.src.push_str(&format!("{result} = Ok({ok_result})\n"));
-                self.src.deindent(2);
-                self.src.push_str(&format!("elif {op0} == 1:\n"));
-                self.src.indent(2);
-                self.src.push_str(&err);
-                self.src
-                    .push_str(&format!("{result} = Err({err_result})\n"));
-                self.src.deindent(2);
+                builder.push_str(&format!("if {op0} == 0:\n"));
+                builder.indent();
+                builder.push_str(&ok);
+                builder.push_str(&format!("{result} = Ok({ok_result})\n"));
+                builder.dedent();
+                builder.push_str(&format!("elif {op0} == 1:\n"));
+                builder.indent();
+                builder.push_str(&err);
+                builder.push_str(&format!("{result} = Err({err_result})\n"));
+                builder.dedent();
 
-                self.src.push_str("else:\n");
-                self.src.indent(2);
-                self.src
+                builder.push_str("else:\n");
+                builder.indent();
+                builder
                     .push_str("raise TypeError(\"invalid variant discriminant for expected\")\n");
-                self.src.deindent(2);
+                builder.dedent();
 
                 results.push(result);
             }
@@ -1959,11 +1544,11 @@ impl Bindgen for FunctionBindgen<'_> {
 
                 let ptr = self.locals.tmp("ptr");
                 let len = self.locals.tmp("len");
-                let array_ty = self.gen.array_ty(iface, element).unwrap();
-                self.gen.needs_list_canon_lower = true;
+                let array_ty = array_ty(iface, element).unwrap();
+                builder.deps.needs_list_canon_lower = true;
                 let size = self.gen.sizes.size(element);
                 let align = self.gen.sizes.align(element);
-                self.src.push_str(&format!(
+                builder.push_str(&format!(
                     "{}, {} = _list_canon_lower({}, ctypes.{}, {}, {}, realloc, memory, caller)\n",
                     ptr, len, operands[0], array_ty, size, align,
                 ));
@@ -1974,10 +1559,10 @@ impl Bindgen for FunctionBindgen<'_> {
                 self.needs_memory = true;
                 let ptr = self.locals.tmp("ptr");
                 let len = self.locals.tmp("len");
-                self.src.push_str(&format!("{} = {}\n", ptr, operands[0]));
-                self.src.push_str(&format!("{} = {}\n", len, operands[1]));
-                let array_ty = self.gen.array_ty(iface, element).unwrap();
-                self.gen.needs_list_canon_lift = true;
+                builder.push_str(&format!("{} = {}\n", ptr, operands[0]));
+                builder.push_str(&format!("{} = {}\n", len, operands[1]));
+                let array_ty = array_ty(iface, element).unwrap();
+                builder.deps.needs_list_canon_lift = true;
                 let lift = format!(
                     "_list_canon_lift({}, {}, {}, ctypes.{}, memory, caller)",
                     ptr,
@@ -1985,26 +1570,32 @@ impl Bindgen for FunctionBindgen<'_> {
                     self.gen.sizes.size(element),
                     array_ty,
                 );
-                let pyty = match element {
-                    Type::U8 => "bytes".to_string(),
-                    _ => {
-                        self.gen.pyimport("typing", "List");
-                        format!("List[{}]", self.gen.type_string(iface, element))
-                    }
-                };
-                self.gen.pyimport("typing", "cast");
-                let result = format!("cast({}, {})", pyty, lift);
+                builder.deps.pyimport("typing", "cast");
                 let align = self.gen.sizes.align(element);
                 match free {
                     Some(free) => {
                         self.needs_free = Some(free.to_string());
                         let list = self.locals.tmp("list");
-                        self.src.push_str(&format!("{} = {}\n", list, result));
-                        self.src
-                            .push_str(&format!("free(caller, {}, {}, {})\n", ptr, len, align));
+                        builder.push_str(&list);
+                        builder.push_str(" = cast(");
+                        builder.print_list(element);
+                        builder.push_str(", ");
+                        builder.push_str(&lift);
+                        builder.push_str(")\n");
+                        builder.push_str(&format!("free(caller, {}, {}, {})\n", ptr, len, align));
                         results.push(list);
                     }
-                    None => results.push(result),
+                    None => {
+                        let mut result_src = Source::default();
+                        drop(builder);
+                        let mut builder = result_src.builder(&mut self.gen.deps, iface);
+                        builder.push_str("cast(");
+                        builder.print_list(element);
+                        builder.push_str(", ");
+                        builder.push_str(&lift);
+                        builder.push_str(")");
+                        results.push(result_src.to_string());
+                    }
                 }
             }
             Instruction::StringLower { realloc } => {
@@ -2017,8 +1608,8 @@ impl Bindgen for FunctionBindgen<'_> {
 
                 let ptr = self.locals.tmp("ptr");
                 let len = self.locals.tmp("len");
-                self.gen.needs_encode_utf8 = true;
-                self.src.push_str(&format!(
+                builder.deps.needs_encode_utf8 = true;
+                builder.push_str(&format!(
                     "{}, {} = _encode_utf8({}, realloc, memory, caller)\n",
                     ptr, len, operands[0],
                 ));
@@ -2029,15 +1620,15 @@ impl Bindgen for FunctionBindgen<'_> {
                 self.needs_memory = true;
                 let ptr = self.locals.tmp("ptr");
                 let len = self.locals.tmp("len");
-                self.src.push_str(&format!("{} = {}\n", ptr, operands[0]));
-                self.src.push_str(&format!("{} = {}\n", len, operands[1]));
-                self.gen.needs_decode_utf8 = true;
+                builder.push_str(&format!("{} = {}\n", ptr, operands[0]));
+                builder.push_str(&format!("{} = {}\n", len, operands[1]));
+                builder.deps.needs_decode_utf8 = true;
                 let result = format!("_decode_utf8(memory, caller, {}, {})", ptr, len);
                 match free {
                     Some(free) => {
                         self.needs_free = Some(free.to_string());
                         let list = self.locals.tmp("list");
-                        self.src.push_str(&format!("{} = {}\n", list, result));
+                        builder.push_str(&format!("{} = {}\n", list, result));
                         self.src
                             .push_str(&format!("free(caller, {}, {}, 1)\n", ptr, len));
                         results.push(list);
@@ -2061,28 +1652,25 @@ impl Bindgen for FunctionBindgen<'_> {
 
                 // first store our vec-to-lower in a temporary since we'll
                 // reference it multiple times.
-                self.src.push_str(&format!("{} = {}\n", vec, operands[0]));
-                self.src.push_str(&format!("{} = len({})\n", len, vec));
+                builder.push_str(&format!("{} = {}\n", vec, operands[0]));
+                builder.push_str(&format!("{} = len({})\n", len, vec));
 
                 // ... then realloc space for the result in the guest module
-                self.src.push_str(&format!(
+                builder.push_str(&format!(
                     "{} = realloc(caller, 0, 0, {}, {} * {})\n",
                     result, align, len, size,
                 ));
-                self.src
-                    .push_str(&format!("assert(isinstance({}, int))\n", result));
+                builder.push_str(&format!("assert(isinstance({}, int))\n", result));
 
                 // ... then consume the vector and use the block to lower the
                 // result.
                 let i = self.locals.tmp("i");
-                self.src
-                    .push_str(&format!("for {} in range(0, {}):\n", i, len));
-                self.src.indent(2);
-                self.src.push_str(&format!("{} = {}[{}]\n", e, vec, i));
-                self.src
-                    .push_str(&format!("{} = {} + {} * {}\n", base, result, i, size));
-                self.src.push_str(&body);
-                self.src.deindent(2);
+                builder.push_str(&format!("for {} in range(0, {}):\n", i, len));
+                builder.indent();
+                builder.push_str(&format!("{} = {}[{}]\n", e, vec, i));
+                builder.push_str(&format!("{} = {} + {} * {}\n", base, result, i, size));
+                builder.push_str(&body);
+                builder.dedent();
 
                 results.push(result);
                 results.push(len);
@@ -2095,28 +1683,25 @@ impl Bindgen for FunctionBindgen<'_> {
                 let align = self.gen.sizes.align(element);
                 let ptr = self.locals.tmp("ptr");
                 let len = self.locals.tmp("len");
-                self.src.push_str(&format!("{} = {}\n", ptr, operands[0]));
-                self.src.push_str(&format!("{} = {}\n", len, operands[1]));
+                builder.push_str(&format!("{} = {}\n", ptr, operands[0]));
+                builder.push_str(&format!("{} = {}\n", len, operands[1]));
                 let result = self.locals.tmp("result");
-                let ty = self.gen.type_string(iface, element);
-                self.src
-                    .push_str(&format!("{}: List[{}] = []\n", result, ty));
+                builder.push_str(&format!("{}: List[", result));
+                builder.print_ty(element, true);
+                builder.push_str("] = []\n");
 
                 let i = self.locals.tmp("i");
-                self.src
-                    .push_str(&format!("for {} in range(0, {}):\n", i, len));
-                self.src.indent(2);
-                self.src
-                    .push_str(&format!("{} = {} + {} * {}\n", base, ptr, i, size));
-                self.src.push_str(&body);
+                builder.push_str(&format!("for {} in range(0, {}):\n", i, len));
+                builder.indent();
+                builder.push_str(&format!("{} = {} + {} * {}\n", base, ptr, i, size));
+                builder.push_str(&body);
                 assert_eq!(body_results.len(), 1);
-                self.src
-                    .push_str(&format!("{}.append({})\n", result, body_results[0]));
-                self.src.deindent(2);
+                builder.push_str(&format!("{}.append({})\n", result, body_results[0]));
+                builder.dedent();
 
                 if let Some(free) = free {
                     self.needs_free = Some(free.to_string());
-                    self.src.push_str(&format!(
+                    builder.push_str(&format!(
                         "free(caller, {}, {} * {}, {})\n",
                         ptr, len, size, align,
                     ));
@@ -2134,75 +1719,31 @@ impl Bindgen for FunctionBindgen<'_> {
                 results.push(name.clone());
                 self.payloads.push(name);
             }
-
-            //    Instruction::BufferLowerHandle { push, ty } => {
-            //        let block = self.blocks.pop().unwrap();
-            //        let size = self.sizes.size(ty);
-            //        let tmp = self.tmp();
-            //        let handle = format!("handle{}", tmp);
-            //        let closure = format!("closure{}", tmp);
-            //        self.needs_buffer_transaction = true;
-            //        if iface.all_bits_valid(ty) {
-            //            let method = if *push { "push_out_raw" } else { "push_in_raw" };
-            //            self.push_str(&format!(
-            //                "let {} = unsafe {{ buffer_transaction.{}({}) }};\n",
-            //                handle, method, operands[0],
-            //            ));
-            //        } else if *push {
-            //            self.closures.push_str(&format!(
-            //                "let {} = |memory: &wasmtime::Memory, base: i32| {{
-            //                    Ok(({}, {}))
-            //                }};\n",
-            //                closure, block, size,
-            //            ));
-            //            self.push_str(&format!(
-            //                "let {} = unsafe {{ buffer_transaction.push_out({}, &{}) }};\n",
-            //                handle, operands[0], closure,
-            //            ));
-            //        } else {
-            //            let start = self.src.len();
-            //            self.print_ty(iface, ty, TypeMode::AllBorrowed("'_"));
-            //            let ty = self.src[start..].to_string();
-            //            self.src.truncate(start);
-            //            self.closures.push_str(&format!(
-            //                "let {} = |memory: &wasmtime::Memory, base: i32, e: {}| {{
-            //                    {};
-            //                    Ok({})
-            //                }};\n",
-            //                closure, ty, block, size,
-            //            ));
-            //            self.push_str(&format!(
-            //                "let {} = unsafe {{ buffer_transaction.push_in({}, &{}) }};\n",
-            //                handle, operands[0], closure,
-            //            ));
-            //        }
-            //        results.push(format!("{}", handle));
-            //    }
             Instruction::CallWasm {
-                module: _,
+                iface: _,
                 name,
                 sig,
             } => {
                 if sig.results.len() > 0 {
                     for i in 0..sig.results.len() {
                         if i > 0 {
-                            self.src.push_str(", ");
+                            builder.push_str(", ");
                         }
                         let ret = self.locals.tmp("ret");
-                        self.src.push_str(&ret);
+                        builder.push_str(&ret);
                         results.push(ret);
                     }
-                    self.src.push_str(" = ");
+                    builder.push_str(" = ");
                 }
-                self.src.push_str(&self.src_object);
-                self.src.push_str("._");
-                self.src.push_str(&name.to_snake_case());
-                self.src.push_str("(caller");
+                builder.push_str(&self.src_object);
+                builder.push_str("._");
+                builder.push_str(&name.to_snake_case());
+                builder.push_str("(caller");
                 if operands.len() > 0 {
-                    self.src.push_str(", ");
+                    builder.push_str(", ");
                 }
-                self.src.push_str(&operands.join(", "));
-                self.src.push_str(")\n");
+                builder.push_str(&operands.join(", "));
+                builder.push_str(")\n");
                 for (ty, name) in sig.results.iter().zip(results.iter()) {
                     let ty = match ty {
                         WasmType::I32 | WasmType::I64 => "int",
@@ -2219,21 +1760,21 @@ impl Bindgen for FunctionBindgen<'_> {
                     }
                     _ => {
                         let result = self.locals.tmp("ret");
-                        self.src.push_str(&result);
+                        builder.push_str(&result);
                         results.push(result);
-                        self.src.push_str(" = ");
+                        builder.push_str(" = ");
                     }
                 }
                 match &func.kind {
                     FunctionKind::Freestanding | FunctionKind::Static { .. } => {
-                        self.src.push_str(&format!(
+                        builder.push_str(&format!(
                             "host.{}({})",
                             func.name.to_snake_case(),
                             operands.join(", "),
                         ));
                     }
                     FunctionKind::Method { name, .. } => {
-                        self.src.push_str(&format!(
+                        builder.push_str(&format!(
                             "{}.{}({})",
                             operands[0],
                             name.to_snake_case(),
@@ -2241,12 +1782,12 @@ impl Bindgen for FunctionBindgen<'_> {
                         ));
                     }
                 }
-                self.src.push_str("\n");
+                builder.push_str("\n");
             }
 
             Instruction::Return { amt, .. } => match amt {
                 0 => {}
-                1 => self.src.push_str(&format!("return {}\n", operands[0])),
+                1 => builder.push_str(&format!("return {}\n", operands[0])),
                 _ => {
                     self.src
                         .push_str(&format!("return ({})\n", operands.join(", ")));
@@ -2275,7 +1816,7 @@ impl Bindgen for FunctionBindgen<'_> {
             } => {
                 self.needs_realloc = Some(realloc.to_string());
                 let ptr = self.locals.tmp("ptr");
-                self.src.push_str(&format!(
+                builder.push_str(&format!(
                     "
                         {ptr} = realloc(caller, 0, 0, {align}, {size})
                         assert(isinstance({ptr}, int))
@@ -2289,73 +1830,31 @@ impl Bindgen for FunctionBindgen<'_> {
     }
 }
 
-#[derive(Default)]
-pub struct Source {
-    s: String,
-    indent: usize,
-}
-
-impl Source {
-    pub fn push_str(&mut self, src: &str) {
-        let lines = src.lines().collect::<Vec<_>>();
-        let mut trim = None;
-        for (i, line) in lines.iter().enumerate() {
-            self.s.push_str(if lines.len() == 1 {
-                line
-            } else {
-                let trim = match trim {
-                    Some(n) => n,
-                    None => {
-                        let val = line.len() - line.trim_start().len();
-                        if !line.is_empty() {
-                            trim = Some(val);
-                        }
-                        val
-                    }
-                };
-                line.get(trim..).unwrap_or("")
-            });
-            if i != lines.len() - 1 || src.ends_with("\n") {
-                self.newline();
-            }
-        }
-    }
-
-    pub fn indent(&mut self, amt: usize) {
-        self.indent += amt;
-        for _ in 0..amt {
-            self.s.push_str("  ");
-        }
-    }
-
-    pub fn deindent(&mut self, amt: usize) {
-        self.indent -= amt;
-        for _ in 0..amt {
-            assert!(self.s.ends_with("  "));
-            self.s.pop();
-            self.s.pop();
-        }
-    }
-
-    fn newline(&mut self) {
-        self.s.push_str("\n");
-        for _ in 0..self.indent {
-            self.s.push_str("  ");
-        }
+fn py_type_class_of(ty: &Type) -> PyTypeClass {
+    match ty {
+        Type::Unit => PyTypeClass::None,
+        Type::Bool
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::S8
+        | Type::S16
+        | Type::S32
+        | Type::S64 => PyTypeClass::Int,
+        Type::Float32 | Type::Float64 => PyTypeClass::Float,
+        Type::Char | Type::String => PyTypeClass::Str,
+        Type::Handle(_) | Type::Id(_) => PyTypeClass::Custom,
     }
 }
 
-impl std::ops::Deref for Source {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.s
-    }
-}
-
-impl From<Source> for String {
-    fn from(s: Source) -> String {
-        s.s
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PyTypeClass {
+    None,
+    Int,
+    Str,
+    Float,
+    Custom,
 }
 
 fn wasm_ty_ctor(ty: WasmType) -> &'static str {
@@ -2373,32 +1872,5 @@ fn wasm_ty_typing(ty: WasmType) -> &'static str {
         WasmType::I64 => "int",
         WasmType::F32 => "float",
         WasmType::F64 => "float",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Source;
-
-    #[test]
-    fn simple_append() {
-        let mut s = Source::default();
-        s.push_str("x");
-        assert_eq!(s.s, "x");
-        s.push_str("y");
-        assert_eq!(s.s, "xy");
-        s.push_str("z ");
-        assert_eq!(s.s, "xyz ");
-        s.push_str(" a ");
-        assert_eq!(s.s, "xyz  a ");
-        s.push_str("\na");
-        assert_eq!(s.s, "xyz  a \na");
-    }
-
-    #[test]
-    fn trim_ws() {
-        let mut s = Source::default();
-        s.push_str("def foo():\n  return 1\n");
-        assert_eq!(s.s, "def foo():\n  return 1\n");
     }
 }
