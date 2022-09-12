@@ -359,7 +359,7 @@ struct InstanceTypeEncoder<'a> {
 }
 
 impl<'a> InstanceTypeEncoder<'a> {
-    fn export(&mut self, name: &'a str, type_ref: ComponentTypeRef) -> Result<()> {
+    fn export_type(&mut self, name: &'a str, type_ref: ComponentTypeRef) -> Result<()> {
         match self.exported_types.entry(name) {
             Entry::Occupied(e) => {
                 if *e.get() != type_ref {
@@ -426,7 +426,7 @@ impl<'a> TypeEncoder<'a> {
         }
     }
 
-    fn encode_instance_imports(
+    fn encode_import_types(
         &mut self,
         interfaces: &'a [Interface],
         required_imports: &IndexSet<&'a str>,
@@ -439,40 +439,57 @@ impl<'a> TypeEncoder<'a> {
 
             Self::validate_interface(import)?;
 
-            let mut instance = InstanceTypeEncoder::default();
+            let mut instance = Some(InstanceTypeEncoder::default());
 
             for func in &import.functions {
                 Self::validate_function(func)?;
 
-                let index = self.encode_func_type(import, func, false)?;
-                instance.export(&func.name, ComponentTypeRef::Func(index))?;
+                let index = self.encode_func_type(import, func, &mut instance)?;
+                self.export_type(&mut instance, &func.name, ComponentTypeRef::Func(index))?;
             }
 
-            let index = self.encode_instance_type(&instance.ty);
+            let index = self.encode_instance_type(&instance.as_ref().unwrap().ty);
             imports.import(import, ComponentTypeRef::Instance(index))?;
         }
 
         Ok(())
     }
 
-    fn encode_func_types(
+    fn encode_export_types(
         &mut self,
         interfaces: impl Iterator<Item = (&'a Interface, bool)>,
-        export_func_types: bool,
+        types_only: bool,
     ) -> Result<()> {
         for (export, is_default) in interfaces {
             Self::validate_interface(export)?;
+
+            let mut instance = if is_default {
+                None
+            } else {
+                if export.name.is_empty() {
+                    bail!("cannot export an unnamed interface");
+                }
+                Some(InstanceTypeEncoder::default())
+            };
 
             // TODO: stick interface documentation in a custom section?
 
             for func in &export.functions {
                 Self::validate_function(func)?;
 
-                let index = self.encode_func_type(export, func, is_default)?;
+                let index = self.encode_func_type(export, func, &mut instance)?;
 
-                if export_func_types {
-                    self.export_type(&func.name, ComponentTypeRef::Func(index))?;
+                if types_only {
+                    self.export_type(&mut instance, &func.name, ComponentTypeRef::Func(index))?;
                 }
+            }
+
+            match instance {
+                Some(instance) if types_only => {
+                    let index = self.encode_instance_type(&instance.ty);
+                    self.export_type(&mut None, &export.name, ComponentTypeRef::Instance(index))?;
+                }
+                _ => {}
             }
         }
 
@@ -489,7 +506,7 @@ impl<'a> TypeEncoder<'a> {
         &mut self,
         interface: &'a Interface,
         func: &'a Function,
-        export_named_types: bool,
+        instance: &mut Option<InstanceTypeEncoder<'a>>,
     ) -> Result<u32> {
         let key = FunctionKey { interface, func };
         if let Some(index) = self.func_type_map.get(&key) {
@@ -503,11 +520,11 @@ impl<'a> TypeEncoder<'a> {
             .map(|(name, ty)| {
                 Ok((
                     Some(name.as_str()),
-                    self.encode_valtype(interface, ty, export_named_types)?,
+                    self.encode_valtype(interface, instance, ty)?,
                 ))
             })
             .collect::<Result<_>>()?;
-        let result = self.encode_valtype(interface, &func.result, export_named_types)?;
+        let result = self.encode_valtype(interface, instance, &func.result)?;
 
         // Encode the function type
         let index = self.types.len();
@@ -519,8 +536,8 @@ impl<'a> TypeEncoder<'a> {
     fn encode_valtype(
         &mut self,
         interface: &'a Interface,
+        instance: &mut Option<InstanceTypeEncoder<'a>>,
         ty: &Type,
-        export_named_types: bool,
     ) -> Result<ComponentValType> {
         Ok(match ty {
             Type::Unit => ComponentValType::Primitive(PrimitiveValType::Unit),
@@ -544,36 +561,22 @@ impl<'a> TypeEncoder<'a> {
                     ComponentValType::Type(*index)
                 } else {
                     let mut encoded = match &ty.kind {
-                        TypeDefKind::Record(r) => {
-                            self.encode_record(interface, r, export_named_types)?
-                        }
-                        TypeDefKind::Tuple(t) => {
-                            self.encode_tuple(interface, t, export_named_types)?
-                        }
+                        TypeDefKind::Record(r) => self.encode_record(interface, instance, r)?,
+                        TypeDefKind::Tuple(t) => self.encode_tuple(interface, instance, t)?,
                         TypeDefKind::Flags(r) => self.encode_flags(r)?,
-                        TypeDefKind::Variant(v) => {
-                            self.encode_variant(interface, v, export_named_types)?
-                        }
-                        TypeDefKind::Union(u) => {
-                            self.encode_union(interface, u, export_named_types)?
-                        }
-                        TypeDefKind::Option(t) => {
-                            self.encode_option(interface, t, export_named_types)?
-                        }
-                        TypeDefKind::Expected(e) => {
-                            self.encode_expected(interface, e, export_named_types)?
-                        }
+                        TypeDefKind::Variant(v) => self.encode_variant(interface, instance, v)?,
+                        TypeDefKind::Union(u) => self.encode_union(interface, instance, u)?,
+                        TypeDefKind::Option(t) => self.encode_option(interface, instance, t)?,
+                        TypeDefKind::Expected(e) => self.encode_expected(interface, instance, e)?,
                         TypeDefKind::Enum(e) => self.encode_enum(e)?,
                         TypeDefKind::List(ty) => {
-                            let ty = self.encode_valtype(interface, ty, export_named_types)?;
+                            let ty = self.encode_valtype(interface, instance, ty)?;
                             let index = self.types.len();
                             let encoder = self.types.defined_type();
                             encoder.list(ty);
                             ComponentValType::Type(index)
                         }
-                        TypeDefKind::Type(ty) => {
-                            self.encode_valtype(interface, ty, export_named_types)?
-                        }
+                        TypeDefKind::Type(ty) => self.encode_valtype(interface, instance, ty)?,
                         TypeDefKind::Future(_) => todo!("encoding for future type"),
                         TypeDefKind::Stream(_) => todo!("encoding for stream type"),
                     };
@@ -595,12 +598,14 @@ impl<'a> TypeEncoder<'a> {
                     encoded
                 };
 
-                if export_named_types {
-                    // Named types need to be exported
-                    if let Some(name) = ty.name.as_deref() {
-                        if let ComponentValType::Type(index) = encoded {
-                            self.export_type(name, ComponentTypeRef::Type(TypeBounds::Eq, index))?;
-                        }
+                // Named types references need to be exported
+                if let Some(name) = ty.name.as_deref() {
+                    if let ComponentValType::Type(index) = encoded {
+                        self.export_type(
+                            instance,
+                            name,
+                            ComponentTypeRef::Type(TypeBounds::Eq, index),
+                        )?;
                     }
                 }
 
@@ -615,8 +620,8 @@ impl<'a> TypeEncoder<'a> {
     fn encode_record(
         &mut self,
         interface: &'a Interface,
+        instance: &mut Option<InstanceTypeEncoder<'a>>,
         record: &Record,
-        export_named_types: bool,
     ) -> Result<ComponentValType> {
         let fields = record
             .fields
@@ -624,7 +629,7 @@ impl<'a> TypeEncoder<'a> {
             .map(|f| {
                 Ok((
                     f.name.as_str(),
-                    self.encode_valtype(interface, &f.ty, export_named_types)?,
+                    self.encode_valtype(interface, instance, &f.ty)?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -638,13 +643,13 @@ impl<'a> TypeEncoder<'a> {
     fn encode_tuple(
         &mut self,
         interface: &'a Interface,
+        instance: &mut Option<InstanceTypeEncoder<'a>>,
         tuple: &Tuple,
-        export_named_types: bool,
     ) -> Result<ComponentValType> {
         let tys = tuple
             .types
             .iter()
-            .map(|ty| self.encode_valtype(interface, ty, export_named_types))
+            .map(|ty| self.encode_valtype(interface, instance, ty))
             .collect::<Result<Vec<_>>>()?;
         let index = self.types.len();
         let encoder = self.types.defined_type();
@@ -662,8 +667,8 @@ impl<'a> TypeEncoder<'a> {
     fn encode_variant(
         &mut self,
         interface: &'a Interface,
+        instance: &mut Option<InstanceTypeEncoder<'a>>,
         variant: &Variant,
-        export_named_types: bool,
     ) -> Result<ComponentValType> {
         let cases = variant
             .cases
@@ -671,7 +676,7 @@ impl<'a> TypeEncoder<'a> {
             .map(|c| {
                 Ok((
                     c.name.as_str(),
-                    self.encode_valtype(interface, &c.ty, export_named_types)?,
+                    self.encode_valtype(interface, instance, &c.ty)?,
                     None, // TODO: support defaulting case values in the future
                 ))
             })
@@ -686,13 +691,13 @@ impl<'a> TypeEncoder<'a> {
     fn encode_union(
         &mut self,
         interface: &'a Interface,
+        instance: &mut Option<InstanceTypeEncoder<'a>>,
         union: &Union,
-        export_named_types: bool,
     ) -> Result<ComponentValType> {
         let tys = union
             .cases
             .iter()
-            .map(|c| self.encode_valtype(interface, &c.ty, export_named_types))
+            .map(|c| self.encode_valtype(interface, instance, &c.ty))
             .collect::<Result<Vec<_>>>()?;
 
         let index = self.types.len();
@@ -704,10 +709,10 @@ impl<'a> TypeEncoder<'a> {
     fn encode_option(
         &mut self,
         interface: &'a Interface,
+        instance: &mut Option<InstanceTypeEncoder<'a>>,
         payload: &Type,
-        export_named_types: bool,
     ) -> Result<ComponentValType> {
-        let ty = self.encode_valtype(interface, payload, export_named_types)?;
+        let ty = self.encode_valtype(interface, instance, payload)?;
         let index = self.types.len();
         let encoder = self.types.defined_type();
         encoder.option(ty);
@@ -717,11 +722,11 @@ impl<'a> TypeEncoder<'a> {
     fn encode_expected(
         &mut self,
         interface: &'a Interface,
+        instance: &mut Option<InstanceTypeEncoder<'a>>,
         expected: &Expected,
-        export_named_types: bool,
     ) -> Result<ComponentValType> {
-        let ok = self.encode_valtype(interface, &expected.ok, export_named_types)?;
-        let error = self.encode_valtype(interface, &expected.err, export_named_types)?;
+        let ok = self.encode_valtype(interface, instance, &expected.ok)?;
+        let error = self.encode_valtype(interface, instance, &expected.err)?;
         let index = self.types.len();
         let encoder = self.types.defined_type();
         encoder.expected(ok, error);
@@ -735,7 +740,16 @@ impl<'a> TypeEncoder<'a> {
         Ok(ComponentValType::Type(index))
     }
 
-    fn export_type(&mut self, name: &'a str, type_ref: ComponentTypeRef) -> Result<()> {
+    fn export_type(
+        &mut self,
+        instance_ty: &mut Option<InstanceTypeEncoder<'a>>,
+        name: &'a str,
+        type_ref: ComponentTypeRef,
+    ) -> Result<()> {
+        if let Some(instance) = instance_ty.as_mut() {
+            return instance.export_type(name, type_ref);
+        }
+
         match self.exported_types.entry(name) {
             Entry::Occupied(e) => {
                 if *e.get() != type_ref {
@@ -778,6 +792,13 @@ impl<'a> TypeEncoder<'a> {
         if !matches!(function.kind, FunctionKind::Freestanding) {
             bail!(
                 "unsupported function `{}`: only free-standing functions are currently supported",
+                function.name
+            );
+        }
+
+        if function.is_async {
+            bail!(
+                "unsupported function `{}`: only synchronous functions are currently supported",
                 function.name
             );
         }
@@ -1130,10 +1151,6 @@ impl EncodingState {
             self.component.section(&functions);
 
             if !interface_exports.is_empty() {
-                if export.name.is_empty() {
-                    bail!("cannot export an unnamed interface");
-                }
-
                 let instance_index = self.instantiate_exports(&mut instances, interface_exports);
                 section.export(&export.name, ComponentExportKind::Instance, instance_index);
             }
@@ -1660,6 +1677,15 @@ impl<'a> ComponentEncoder<'a> {
         self
     }
 
+    /// Sets whether or not the encoder will only encode types.
+    ///
+    /// A types-only encoding is sufficient to describe a component's
+    /// interface, but does not contain an implementation.
+    pub fn types_only(mut self, types_only: bool) -> Self {
+        self.types_only = types_only;
+        self
+    }
+
     /// Encode the component and return the bytes.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let (required_imports, has_memory, has_realloc) = if !self.module.is_empty() {
@@ -1678,8 +1704,8 @@ impl<'a> ComponentEncoder<'a> {
         let mut state = EncodingState::default();
         let mut types = TypeEncoder::default();
         let mut imports = ImportEncoder::default();
-        types.encode_func_types(exports.clone(), false)?;
-        types.encode_instance_imports(self.imports, &required_imports, &mut imports)?;
+        types.encode_import_types(self.imports, &required_imports, &mut imports)?;
+        types.encode_export_types(exports.clone(), self.types_only)?;
         types.finish(&mut state.component);
 
         if self.types_only {
@@ -1698,55 +1724,6 @@ impl<'a> ComponentEncoder<'a> {
         }
 
         let bytes = state.component.finish();
-
-        if self.validate {
-            let mut validator = Validator::new_with_features(WasmFeatures {
-                component_model: true,
-                ..Default::default()
-            });
-
-            validator
-                .validate_all(&bytes)
-                .context("failed to validate component output")?;
-        }
-
-        Ok(bytes)
-    }
-}
-
-/// An encoder for a single interface definition.
-///
-/// The resulting component will only encode the type information
-/// of the interface.
-pub struct InterfaceEncoder<'a> {
-    interface: &'a Interface,
-    validate: bool,
-}
-
-impl<'a> InterfaceEncoder<'a> {
-    /// Create a new encoder for the given interface.
-    pub fn new(interface: &'a Interface) -> Self {
-        Self {
-            interface,
-            validate: false,
-        }
-    }
-
-    /// Sets whether or not the encoder will validate its output.
-    pub fn validate(mut self, validate: bool) -> Self {
-        self.validate = validate;
-        self
-    }
-
-    /// Encode the interface as a component and return the bytes.
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut component = Component::default();
-
-        let mut types = TypeEncoder::default();
-        types.encode_func_types([(self.interface, true)].into_iter(), true)?;
-        types.finish(&mut component);
-
-        let bytes = component.finish();
 
         if self.validate {
             let mut validator = Validator::new_with_features(WasmFeatures {

@@ -3,8 +3,7 @@
 #![deny(missing_docs)]
 
 use crate::{
-    decode_interface_component, ComponentEncoder, InterfaceEncoder, InterfacePrinter,
-    StringEncoding,
+    decode_interface_component, encoding::ComponentEncoder, InterfacePrinter, StringEncoding,
 };
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -147,7 +146,9 @@ impl WitToWasmApp {
 
         let interface = parse_interface(None, &self.interface)?;
 
-        let encoder = InterfaceEncoder::new(&interface).validate(true);
+        let encoder = ComponentEncoder::default()
+            .interface(&interface)
+            .types_only(true);
 
         let bytes = encoder.encode().with_context(|| {
             format!(

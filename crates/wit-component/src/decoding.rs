@@ -249,6 +249,7 @@ impl<'a> InterfaceDecoder<'a> {
         let result = self.decode_type(&ty.result)?;
 
         self.interface.functions.push(Function {
+            is_async: false,
             docs: Docs::default(),
             name: func_name.to_string(),
             kind: FunctionKind::Freestanding,
