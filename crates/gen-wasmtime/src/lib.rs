@@ -967,7 +967,7 @@ impl Generator for Wasmtime {
             self.push_str(&name);
             self.push_str("<T> {\n");
             self.push_str(&format!(
-                "get_state: Box<dyn Fn(&mut T) -> &mut {}Data + Send + Sync>,\n",
+                "pub get_state: Box<dyn Fn(&mut T) -> &mut {}Data + Send + Sync>,\n",
                 name
             ));
             for (name, (ty, _)) in exports.fields.iter() {
