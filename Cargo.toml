@@ -68,7 +68,7 @@ default = [
   'markdown',
   # TODO: fix these code generators and turn them back on
   # 'teavm-java',
-  # 'go',
+  'go',
 ]
 c = ['dep:wit-bindgen-c']
 rust = ['dep:wit-bindgen-rust']
