@@ -783,16 +783,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
     fn type_resource(&mut self, id: TypeId, name: &str, _docs: &Docs) {
         let ns = self.owner_namespace(id);
         let snake = name.to_snake_case();
-        let mut own = ns.clone();
-        let mut borrow = own.clone();
-        own.push_str("_own");
-        borrow.push_str("_borrow");
-        own.push_str("_");
-        borrow.push_str("_");
-        own.push_str(&snake);
-        borrow.push_str(&snake);
-        own.push_str("_t");
-        borrow.push_str("_t");
+        let (own, borrow) = self.reosurce_handle_names(id, name);
 
         // All resources, whether or not they're imported or exported, get the
         // ability to drop handles. Note that the component model only has a
@@ -1062,7 +1053,7 @@ void __wasm_export_{ns}_{snake}_dtor({ns}_{snake}_t* arg) {{
         }
     }
 
-    fn type_alias(&mut self, id: TypeId, _name: &str, ty: &Type, docs: &Docs) {
+    fn type_alias(&mut self, id: TypeId, name: &str, ty: &Type, docs: &Docs) {
         let target = dealias(self.resolve, id);
         if !matches!(&self.resolve.types[target].kind,
                      TypeDefKind::Resource if self.gen.resources[&target].direction == Direction::Import)
@@ -1073,6 +1064,32 @@ void __wasm_export_{ns}_{snake}_dtor({ns}_{snake}_t* arg) {{
             self.print_ty(SourceType::HDefs, ty);
             self.src.h_defs(" ");
             self.print_typedef_target(id);
+        }
+
+        // If target is a resource type, then we need to generate alias for own and borrow
+        // the own and borrow handle types must exist due to the generation step in `type_resource`.
+        if matches!(&self.resolve.types[target].kind, TypeDefKind::Resource) {
+            // this generates the alias for own and borrow handles as we don't have a
+            // type for them in this function, only the resource type.
+            let (own, borrow) = self.reosurce_handle_names(id, name);
+
+            self.src.h_defs("\n");
+            self.docs(docs, SourceType::HDefs);
+            self.src.h_defs("typedef ");
+            let info = &self.gen.resources[&target];
+            self.src.h_defs(&info.own);
+            self.src.h_defs(" ");
+            self.src.h_defs(&own);
+            self.src.h_defs(";\n");
+
+            self.src.h_defs("\n");
+            self.docs(docs, SourceType::HDefs);
+            let info = &self.gen.resources[&target];
+            self.src.h_defs("typedef ");
+            self.src.h_defs(&info.borrow);
+            self.src.h_defs(" ");
+            self.src.h_defs(&borrow);
+            self.src.h_defs(";\n");
         }
     }
 
@@ -1089,6 +1106,24 @@ void __wasm_export_{ns}_{snake}_dtor({ns}_{snake}_t* arg) {{
 
     fn type_builtin(&mut self, id: TypeId, name: &str, ty: &Type, docs: &Docs) {
         let _ = (id, name, ty, docs);
+    }
+}
+
+impl<'a> InterfaceGenerator<'a> {
+    fn reosurce_handle_names(&mut self, id: TypeId, name: &str) -> (String, String) {
+        let ns = self.owner_namespace(id);
+        let snake = name.to_snake_case();
+        let mut own = ns.clone();
+        let mut borrow = own.clone();
+        own.push_str("_own");
+        borrow.push_str("_borrow");
+        own.push_str("_");
+        borrow.push_str("_");
+        own.push_str(&snake);
+        borrow.push_str(&snake);
+        own.push_str("_t");
+        borrow.push_str("_t");
+        (own, borrow)
     }
 }
 
@@ -1122,7 +1157,14 @@ impl InterfaceGenerator<'_> {
 
             match &self.resolve.types[ty].name {
                 Some(name) => self.define_type(name, ty),
-                None => self.define_anonymous_type(ty),
+                None => {
+                    // an optimization to remove duplicated typedefs:
+                    // do not generate a typedef for each handle type as this is handled
+                    // in `type_alias` for resource types.
+                    if !(matches!(&self.resolve.types[ty].kind, TypeDefKind::Handle(_))) {
+                        self.define_anonymous_type(ty);
+                    }
+                }
             }
 
             self.define_dtor(ty);
